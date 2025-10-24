@@ -1,6 +1,7 @@
 //! common: shared protocol, crypto, framing.
 pub mod proto;
 pub mod crypto;
+pub mod framing;
 
 use serde::{Deserialize, Serialize};
 

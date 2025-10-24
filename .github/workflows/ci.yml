@@ -12,12 +12,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Quick win: install fmt + clippy components
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      # (Optional) Cache to speed builds
       - name: Cache cargo registry + target
         uses: actions/cache@v4
         with:
@@ -44,7 +42,7 @@ jobs:
       - name: Security audit
         run: |
           cargo install cargo-audit --locked || true
-          cargo audit || true   # keep non-fatal for now
+          cargo audit || true
 
   simulation-positive:
     runs-on: ubuntu-latest
@@ -52,6 +50,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build VS and GS first (fail early)
+        run: cargo build -p vs -p gs-sim
 
       - name: Generate ephemeral validator keypair
         run: cargo run -p tools --bin gen_keys
@@ -64,13 +65,13 @@ jobs:
       - name: Wait for VS (poll port 4444)
         run: |
           set -euo pipefail
-          for i in {1..100}; do
+          for i in {1..200}; do
             if (exec 3<>/dev/tcp/127.0.0.1/4444) 2>/dev/null; then
               exec 3>&-; echo "VS ready"; exit 0
             fi
             sleep 0.2
           done
-          echo "VS did not start listening on 4444"; exit 1
+          echo "VS did not start listening on 4444"; echo "---- VS LOG ----"; cat vs.log; exit 1
 
       - name: Start GS (happy path)
         run: cargo run -p gs-sim -- --vs 127.0.0.1:4444 --run-seconds 5
@@ -81,9 +82,7 @@ jobs:
       - name: Upload VS logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
-        with:
-          name: vs-log
-          path: vs.log
+        with: { name: vs-log, path: vs.log }
 
       - name: Kill VS (cleanup)
         if: always()
@@ -99,6 +98,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Build VS and GS first (fail early)
+        run: cargo build -p vs -p gs-sim
+
       - name: Generate keys
         run: cargo run -p tools --bin gen_keys
 
@@ -110,13 +112,13 @@ jobs:
       - name: Wait for VS (poll port 4444)
         run: |
           set -euo pipefail
-          for i in {1..100}; do
+          for i in {1..200}; do
             if (exec 3<>/dev/tcp/127.0.0.1/4444) 2>/dev/null; then
               exec 3>&-; echo "VS ready"; exit 0
             fi
             sleep 0.2
           done
-          echo "VS did not start listening on 4444"; exit 1
+          echo "VS did not start listening on 4444"; echo "---- VS LOG ----"; cat vs.log; exit 1
 
       - name: Start GS with one replayed heartbeat
         run: |
@@ -128,9 +130,7 @@ jobs:
       - name: Upload VS logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
-        with:
-          name: vs-log-replay
-          path: vs.log
+        with: { name: vs-log-replay, path: vs.log }
 
       - name: Kill VS (cleanup)
         if: always()
@@ -146,6 +146,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Build VS and GS first (fail early)
+        run: cargo build -p vs -p gs-sim
+
       - name: Generate keys
         run: cargo run -p tools --bin gen_keys
 
@@ -157,13 +160,13 @@ jobs:
       - name: Wait for VS (poll port 4444)
         run: |
           set -euo pipefail
-          for i in {1..100}; do
+          for i in {1..200}; do
             if (exec 3<>/dev/tcp/127.0.0.1/4444) 2>/dev/null; then
               exec 3>&-; echo "VS ready"; exit 0
             fi
             sleep 0.2
           done
-          echo "VS did not start listening on 4444"; exit 1
+          echo "VS did not start listening on 4444"; echo "---- VS LOG ----"; cat vs.log; exit 1
 
       - name: Start GS (longer run)
         run: cargo run -p gs-sim -- --vs 127.0.0.1:4444 --run-seconds 10 &
@@ -179,9 +182,7 @@ jobs:
       - name: Upload VS logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
-        with:
-          name: vs-log-timeout
-          path: vs.log
+        with: { name: vs-log-timeout, path: vs.log }
 
       - name: Kill VS (cleanup)
         if: always()
