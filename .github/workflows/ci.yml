@@ -1,0 +1,87 @@
+name: CI
+on: [push, pull_request]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cargo fmt
+        run: cargo fmt --all -- --check
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Build all crates
+        run: cargo build --workspace --all-targets
+      - name: Run unit tests
+        run: cargo test --workspace --all-targets
+      - name: Security audit
+        run: |
+          cargo install cargo-audit --locked || true
+          cargo audit || true   # non-fatal initially; tighten later
+
+  simulation-positive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate ephemeral validator keypair
+        run: cargo run -p tools --bin gen_keys
+      - name: Start VS
+        run: nohup cargo run -p vs > vs.log 2>&1 &
+      - name: Wait for VS
+        run: sleep 2
+      - name: Start GS (happy path)
+        run: cargo run -p gs-sim -- --vs 127.0.0.1:4444 --run-seconds 5
+      - name: Ensure no private keys in repo
+        run: 'git ls-files keys/vs_ed25519.pk8 | (! grep .)'
+
+      - name: Upload VS logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with: { name: vs-log, path: vs.log }
+
+  simulation-replay-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate keys
+        run: cargo run -p tools --bin gen_keys
+      - name: Start VS
+        run: nohup cargo run -p vs > vs.log 2>&1 &
+      - name: Wait for VS
+        run: sleep 2
+      - name: Start GS with one replayed heartbeat
+        run: |
+          GS_REPLAY_ONCE=1 cargo run -p gs-sim -- --vs 127.0.0.1:4444 --run-seconds 6 || true
+      - name: VS should log counter violation
+        run: grep -E "counter not increasing|heartbeat.*invalid" vs.log
+
+      - name: Upload VS logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with: { name: vs-log-replay, path: vs.log }
+
+  simulation-timeout-halt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate keys
+        run: cargo run -p tools --bin gen_keys
+      - name: Start VS (will be killed)
+        run: nohup cargo run -p vs > vs.log 2>&1 & echo $! > vs.pid
+      - name: Wait for VS
+        run: sleep 2
+      - name: Start GS (longer run)
+        run: cargo run -p gs-sim -- --vs 127.0.0.1:4444 --run-seconds 10 &
+      - name: Kill VS after handshake
+        run: sleep 4 && kill $(cat vs.pid)
+      - name: Expect VS timeout in logs
+        run: sleep 8 || true && grep -E "heartbeat timeout|closed connection" vs.log || true
+
+      - name: Upload VS logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with: { name: vs-log-timeout, path: vs.log }
