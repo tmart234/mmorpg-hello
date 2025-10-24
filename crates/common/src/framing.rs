@@ -1,12 +1,12 @@
 use anyhow::{anyhow, Result};
+use futures::io::{AsyncReadExt, AsyncWriteExt}; // ← futures, not tokio
 use serde::{de::DeserializeOwned, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub async fn send_msg<T: Serialize>(s: &mut quinn::SendStream, v: &T) -> Result<()> {
     let body = bincode::serialize(v)?;
     s.write_all(&(body.len() as u32).to_be_bytes()).await?;
     s.write_all(&body).await?;
-    s.finish()?; // ← no .await here
+    s.finish()?; // no .await
     Ok(())
 }
 

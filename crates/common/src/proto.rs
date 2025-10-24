@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
 
 pub type Sha256 = [u8; 32];
 pub type Sig = [u8; 64];
@@ -10,8 +11,9 @@ pub struct JoinRequest {
     pub sw_hash: Sha256,
     pub t_unix_ms: u64,
     pub nonce: [u8; 16],
-    pub sig_gs: Sig,
-    pub gs_pub: PubKey,
+    #[serde(with = "BigArray")]
+    pub sig_gs: Sig, // 64 bytes -> needs BigArray
+    pub gs_pub: PubKey, // 32 bytes -> OK without BigArray
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -20,6 +22,7 @@ pub struct JoinAccept {
     pub ticket_key_id: u32,
     pub not_before_ms: u64,
     pub not_after_ms: u64,
+    #[serde(with = "BigArray")]
     pub sig_vs: Sig,
 }
 
@@ -31,6 +34,7 @@ pub struct PlayTicket {
     pub not_before_ms: u64,
     pub not_after_ms: u64,
     pub prev_ticket_hash: Sha256,
+    #[serde(with = "BigArray")]
     pub sig_vs: Sig,
 }
 
@@ -40,6 +44,7 @@ pub struct Heartbeat {
     pub gs_counter: u64,
     pub gs_time_ms: u64,
     pub receipt_tip: Sha256,
+    #[serde(with = "BigArray")]
     pub sig_gs: Sig,
 }
 
@@ -52,5 +57,6 @@ pub struct ProtectedReceipt {
     pub ticket_counter_ref: u64,
     pub prev_receipt_hash: Sha256,
     pub receipt_hash: Sha256,
+    #[serde(with = "BigArray")]
     pub sig_vs: Sig,
 }

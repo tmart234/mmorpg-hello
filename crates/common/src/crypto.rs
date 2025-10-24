@@ -36,8 +36,10 @@ pub fn file_sha256(path: &std::path::Path) -> std::io::Result<[u8; 32]> {
 
 pub fn gen_ed25519() -> (SigningKey, VerifyingKey) {
     let sk = SigningKey::generate(&mut OsRng);
-    (sk, sk.verifying_key())
+    let pk = sk.verifying_key();
+    (sk, pk)
 }
+
 pub fn sign(sk: &SigningKey, m: &[u8]) -> [u8; 64] {
     sk.sign(m).to_bytes()
 }
