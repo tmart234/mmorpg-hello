@@ -14,5 +14,4 @@ sha2 = { workspace = true }
 rand = { workspace = true }
 clap = { workspace = true }
 hex = { workspace = true }
-rustls = { workspace = true }
 common = { path = "../common" }

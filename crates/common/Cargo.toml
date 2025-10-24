@@ -4,11 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-serde = { workspace = true }
+anyhow = { workspace = true }
 bincode = { workspace = true }
-ed25519-dalek = { workspace = true }
+quinn   = { workspace = true }
+futures = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
 sha2 = { workspace = true }
 rand = { workspace = true }
+hex  = { workspace = true }
 tokio = { workspace = true }
-quinn = { workspace = true }
-serde-big-array = "0.5"  
+serde = { version = "1", features = ["derive"] }
+serde-big-array = "0.5"

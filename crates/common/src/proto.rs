@@ -2,24 +2,24 @@ use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 
 pub type Sha256 = [u8; 32];
-pub type Sig = [u8; 64];
+pub type Sig    = [u8; 64];
 pub type PubKey = [u8; 32];
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct JoinRequest {
     pub gs_id: String,
+    pub gs_pub: PubKey,
     pub sw_hash: Sha256,
     pub t_unix_ms: u64,
     pub nonce: [u8; 16],
-    #[serde(with = "BigArray")]
-    pub sig_gs: Sig, // 64 bytes -> needs BigArray
-    pub gs_pub: PubKey, // 32 bytes -> OK without BigArray
+    #[serde(with = "BigArray")]  // <-- add this
+    pub sig_gs: Sig,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct JoinAccept {
     pub session_id: [u8; 16],
-    pub ticket_key_id: u32,
+    pub ticket_key_id: u32,       
     pub not_before_ms: u64,
     pub not_after_ms: u64,
     #[serde(with = "BigArray")]
@@ -45,7 +45,7 @@ pub struct Heartbeat {
     pub gs_time_ms: u64,
     pub receipt_tip: Sha256,
     #[serde(with = "BigArray")]
-    pub sig_gs: Sig,
+    pub sig_vs: Sig,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
