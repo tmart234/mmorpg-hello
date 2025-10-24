@@ -6,7 +6,7 @@ pub async fn send_msg<T: Serialize>(s: &mut quinn::SendStream, v: &T) -> Result<
     let body = bincode::serialize(v)?;
     s.write_all(&(body.len() as u32).to_be_bytes()).await?;
     s.write_all(&body).await?;
-    s.finish().await?;
+    s.finish()?; // ← no .await here
     Ok(())
 }
 
