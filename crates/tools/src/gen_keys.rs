@@ -7,8 +7,14 @@ fn main() {
     let pk = sk.verifying_key();
     fs::create_dir_all("keys").unwrap();
 
-    File::create("keys/vs_ed25519.pk8").unwrap().write_all(&sk.to_bytes()).unwrap();
-    File::create("keys/vs_ed25519.pub").unwrap().write_all(&pk.to_bytes()).unwrap();
+    File::create("keys/vs_ed25519.pk8")
+        .unwrap()
+        .write_all(&sk.to_bytes())
+        .unwrap();
+    File::create("keys/vs_ed25519.pub")
+        .unwrap()
+        .write_all(&pk.to_bytes())
+        .unwrap();
 
     println!("Generated keys: keys/vs_ed25519.pk8 + .pub");
 }

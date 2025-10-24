@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub type Sha256 = [u8; 32];
-pub type Sig    = [u8; 64];
+pub type Sig = [u8; 64];
 pub type PubKey = [u8; 32];
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

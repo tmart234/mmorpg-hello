@@ -153,13 +153,9 @@ async fn ticket_listener(conn: quinn::Connection) -> Result<()> {
                 drop(send); // not replying on this stream
                 match recv_msg::<PlayTicket>(&mut recv).await {
                     Ok(pt) => {
-                        let ok_time =
-                            pt.not_before_ms.saturating_sub(500) <= now_ms()
-                                && now_ms() <= pt.not_after_ms.saturating_add(500);
-                        println!(
-                            "[GS] ticket #{} (time_ok={})",
-                            pt.counter, ok_time
-                        );
+                        let ok_time = pt.not_before_ms.saturating_sub(500) <= now_ms()
+                            && now_ms() <= pt.not_after_ms.saturating_add(500);
+                        println!("[GS] ticket #{} (time_ok={})", pt.counter, ok_time);
                     }
                     Err(e) => {
                         eprintln!("[GS] bad ticket: {e:?}");

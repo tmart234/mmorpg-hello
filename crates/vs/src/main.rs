@@ -3,8 +3,8 @@ use common::{
     crypto::{now_ms, rand_u128, sha256, sign, verify},
     proto::{Heartbeat, JoinAccept, JoinRequest, PlayTicket},
 };
-use futures::stream::StreamExt;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use futures::stream::StreamExt;
 use quinn::{Endpoint, Incoming, ServerConfig};
 use rcgen::generate_simple_self_signed;
 use std::{
@@ -102,7 +102,9 @@ async fn handle_conn(
 
     // 2) PlayTicket task
     let conn_tickets = connection.clone();
-    tokio::spawn(async move { let _ = playticket_task(conn_tickets, vs_sk, session_id).await; });
+    tokio::spawn(async move {
+        let _ = playticket_task(conn_tickets, vs_sk, session_id).await;
+    });
 
     // 3) Heartbeat monitor
     tokio::spawn(heartbeat_task(
@@ -217,7 +219,9 @@ async fn make_quic_server(bind: &str) -> Result<(Endpoint, Incoming)> {
 
 fn load_vs_signing_key(path: &str) -> Result<SigningKey> {
     let bytes = std::fs::read(path)?;
-    let arr: [u8; 32] = bytes.try_into().map_err(|_| anyhow!("vs key must be 32 bytes"))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("vs key must be 32 bytes"))?;
     Ok(SigningKey::from_bytes(&arr))
 }
 
