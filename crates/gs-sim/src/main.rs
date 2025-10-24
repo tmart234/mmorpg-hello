@@ -7,9 +7,9 @@
 use anyhow::*;
 use clap::Parser;
 use common::{
-  crypto::{file_sha256, heartbeat_sign_bytes, join_request_sign_bytes, now_ms, sign},
-  framing::{recv_msg, send_msg},
-  Heartbeat, JoinAccept, JoinRequest, PlayTicket, Sig,
+    crypto::{file_sha256, heartbeat_sign_bytes, join_request_sign_bytes, now_ms, sign},
+    framing::{recv_msg, send_msg},
+    proto::{Heartbeat, JoinAccept, JoinRequest, PlayTicket, Sig},
 };
 
 use ed25519_dalek::{SigningKey, VerifyingKey};

@@ -1,87 +1,191 @@
 name: CI
 on: [push, pull_request]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+
+      # Quick win: install fmt + clippy components
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # (Optional) Cache to speed builds
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
       - name: Cargo fmt
         run: cargo fmt --all -- --check
+
       - name: Cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
       - name: Build all crates
         run: cargo build --workspace --all-targets
+
       - name: Run unit tests
         run: cargo test --workspace --all-targets
+
       - name: Security audit
         run: |
           cargo install cargo-audit --locked || true
-          cargo audit || true   # non-fatal initially; tighten later
+          cargo audit || true   # keep non-fatal for now
 
   simulation-positive:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+
       - name: Generate ephemeral validator keypair
         run: cargo run -p tools --bin gen_keys
+
       - name: Start VS
-        run: nohup cargo run -p vs > vs.log 2>&1 &
-      - name: Wait for VS
-        run: sleep 2
+        run: |
+          set -euo pipefail
+          nohup bash -c 'cargo run -p vs' > vs.log 2>&1 & echo $! > vs.pid
+
+      - name: Wait for VS (poll port 4444)
+        run: |
+          set -euo pipefail
+          for i in {1..100}; do
+            if (exec 3<>/dev/tcp/127.0.0.1/4444) 2>/dev/null; then
+              exec 3>&-; echo "VS ready"; exit 0
+            fi
+            sleep 0.2
+          done
+          echo "VS did not start listening on 4444"; exit 1
+
       - name: Start GS (happy path)
         run: cargo run -p gs-sim -- --vs 127.0.0.1:4444 --run-seconds 5
+
       - name: Ensure no private keys in repo
         run: 'git ls-files keys/vs_ed25519.pk8 | (! grep .)'
 
       - name: Upload VS logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
-        with: { name: vs-log, path: vs.log }
+        with:
+          name: vs-log
+          path: vs.log
+
+      - name: Kill VS (cleanup)
+        if: always()
+        run: |
+          if [ -f vs.pid ] && kill -0 "$(cat vs.pid)" 2>/dev/null; then
+            kill "$(cat vs.pid)" || true
+          fi
 
   simulation-replay-deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+
       - name: Generate keys
         run: cargo run -p tools --bin gen_keys
+
       - name: Start VS
-        run: nohup cargo run -p vs > vs.log 2>&1 &
-      - name: Wait for VS
-        run: sleep 2
+        run: |
+          set -euo pipefail
+          nohup bash -c 'cargo run -p vs' > vs.log 2>&1 & echo $! > vs.pid
+
+      - name: Wait for VS (poll port 4444)
+        run: |
+          set -euo pipefail
+          for i in {1..100}; do
+            if (exec 3<>/dev/tcp/127.0.0.1/4444) 2>/dev/null; then
+              exec 3>&-; echo "VS ready"; exit 0
+            fi
+            sleep 0.2
+          done
+          echo "VS did not start listening on 4444"; exit 1
+
       - name: Start GS with one replayed heartbeat
         run: |
           GS_REPLAY_ONCE=1 cargo run -p gs-sim -- --vs 127.0.0.1:4444 --run-seconds 6 || true
+
       - name: VS should log counter violation
         run: grep -E "counter not increasing|heartbeat.*invalid" vs.log
 
       - name: Upload VS logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
-        with: { name: vs-log-replay, path: vs.log }
+        with:
+          name: vs-log-replay
+          path: vs.log
+
+      - name: Kill VS (cleanup)
+        if: always()
+        run: |
+          if [ -f vs.pid ] && kill -0 "$(cat vs.pid)" 2>/dev/null; then
+            kill "$(cat vs.pid)" || true
+          fi
 
   simulation-timeout-halt:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+
       - name: Generate keys
         run: cargo run -p tools --bin gen_keys
+
       - name: Start VS (will be killed)
-        run: nohup cargo run -p vs > vs.log 2>&1 & echo $! > vs.pid
-      - name: Wait for VS
-        run: sleep 2
+        run: |
+          set -euo pipefail
+          nohup bash -c 'cargo run -p vs' > vs.log 2>&1 & echo $! > vs.pid
+
+      - name: Wait for VS (poll port 4444)
+        run: |
+          set -euo pipefail
+          for i in {1..100}; do
+            if (exec 3<>/dev/tcp/127.0.0.1/4444) 2>/dev/null; then
+              exec 3>&-; echo "VS ready"; exit 0
+            fi
+            sleep 0.2
+          done
+          echo "VS did not start listening on 4444"; exit 1
+
       - name: Start GS (longer run)
         run: cargo run -p gs-sim -- --vs 127.0.0.1:4444 --run-seconds 10 &
+
       - name: Kill VS after handshake
-        run: sleep 4 && kill $(cat vs.pid)
+        run: sleep 4 && kill "$(cat vs.pid)"
+
       - name: Expect VS timeout in logs
-        run: sleep 8 || true && grep -E "heartbeat timeout|closed connection" vs.log || true
+        run: |
+          sleep 8 || true
+          grep -E "heartbeat timeout|closed connection" vs.log || true
 
       - name: Upload VS logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
-        with: { name: vs-log-timeout, path: vs.log }
+        with:
+          name: vs-log-timeout
+          path: vs.log
+
+      - name: Kill VS (cleanup)
+        if: always()
+        run: |
+          if [ -f vs.pid ] && kill -0 "$(cat vs.pid)" 2>/dev/null; then
+            kill "$(cat vs.pid)" || true
+          fi
