@@ -23,7 +23,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::time::sleep; // for hex::encode
+use tokio::time::sleep;
 
 #[derive(Parser, Debug)]
 struct Opts {
@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
     let (endpoint, server_addr) = make_endpoint_and_addr(&opts.vs)?;
     let conn: Connection = endpoint
         .connect_with(make_client_cfg_insecure()?, server_addr, "vs.dev")?
-        .await?; // <-- unwrap Result<Connection, ConnectionError>
+        .await?; // Result<Connection, ConnectionError> -> Connection
     println!("[GS] connected to VS at {server_addr}");
 
     // ---- Send JoinRequest on a fresh bi-stream ----
@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
     send_msg(&mut jsend, &jr).await?;
     let ja: JoinAccept = recv_msg(&mut jrecv).await?;
     println!(
-        "[GS] joined. session_id={}.. (vs sig ok = {} bytes)",
+        "[GS] joined. session_id={}.. (vs sig {} bytes)",
         hex::encode(&ja.session_id[..4]),
         ja.sig_vs.len()
     );
@@ -108,8 +108,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // main task just hangs out while background tasks run;
-    // if either dies, bail.
+    // main task chills while background tasks run;
+    // if either ends, we log + exit.
     loop {
         sleep(Duration::from_secs(60)).await;
         if hb_task.is_finished() || ticket_task.is_finished() {
@@ -127,7 +127,8 @@ async fn heartbeat_loop(
     gs_sk: SigningKey,
     session_id: [u8; 16],
 ) -> Result<()> {
-    let receipt_tip = [0u8; 32]; // no receipts yet
+    // no receipts yet
+    let receipt_tip = [0u8; 32];
 
     loop {
         sleep(Duration::from_secs(2)).await;
@@ -174,6 +175,7 @@ async fn ticket_listener(conn: Connection) -> Result<()> {
 
         let (send, mut recv) = pair.unwrap();
         drop(send);
+
         let pt_res = recv_msg::<PlayTicket>(&mut recv).await;
         match pt_res {
             Ok(pt) => {

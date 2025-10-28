@@ -46,11 +46,7 @@ fn ensure_vs_keys() -> Result<()> {
     fs::write(&skp, sk.to_bytes()).context("write vs_sk")?;
     fs::write(&pkp, pk.to_bytes()).context("write vs_pk")?;
 
-    println!(
-        "Generated keys: {}, {}",
-        skp.display(),
-        pkp.display()
-    );
+    println!("Generated keys: {}, {}", skp.display(), pkp.display());
 
     Ok(())
 }
