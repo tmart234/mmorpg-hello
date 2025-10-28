@@ -4,14 +4,15 @@
 //! - Sends signed heartbeats
 //! - Listens for PlayTickets
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use common::{
-    crypto::{file_sha256, heartbeat_sign_bytes, join_request_sign_bytes, now_ms, sign, verify},
+    crypto::{
+        file_sha256, heartbeat_sign_bytes, join_request_sign_bytes, now_ms, sha256, sign, verify,
+    },
     framing::{recv_msg, send_msg},
     proto::{Heartbeat, JoinAccept, JoinRequest, PlayTicket, Sig},
 };
-
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use quinn::{ClientConfig, Connection, Endpoint};
 use rand::{rngs::OsRng, RngCore};
@@ -51,18 +52,18 @@ struct Opts {
 async fn main() -> Result<()> {
     let opts = Opts::parse();
 
-    // Load or generate GS signing keypair
+    // Load or generate GS signing keypair.
     let (gs_sk, gs_pk) = load_or_make_keys(&opts.gs_sk, &opts.gs_pk)?;
 
-    // Compute a dev "attestation" hash of this binary
+    // Compute dev "attestation" hash of this binary.
     let exe = std::env::current_exe()?;
     let sw_hash = file_sha256(&exe)?;
 
-    // Create a QUIC client Endpoint + connect to VS
+    // QUIC client endpoint + connect to VS.
     let (endpoint, server_addr) = make_endpoint_and_addr(&opts.vs)?;
     let conn: Connection = endpoint
         .connect_with(make_client_cfg_insecure()?, server_addr, "vs.dev")?
-        .await?; // Result<Connection, ConnectionError> -> Connection
+        .await?;
     println!("[GS] connected to VS at {server_addr}");
 
     // ---- Send JoinRequest on a fresh bi-stream ----
@@ -85,13 +86,12 @@ async fn main() -> Result<()> {
     let (mut jsend, mut jrecv) = conn.open_bi().await?;
     send_msg(&mut jsend, &jr).await?;
     let ja: JoinAccept = recv_msg(&mut jrecv).await?;
-    // Reconstruct VS pubkey from the bytes VS gave us.
-    let vs_pub =
-        VerifyingKey::from_bytes(&ja.vs_pub).context("JoinAccept vs_pub invalid length")?;
-    // VS is supposed to sign just the session_id.
-    let vs_sig_ok = verify(&vs_pub, &ja.session_id, &ja.sig_vs);
-    if !vs_sig_ok {
-        return Err(anyhow!("VS signature on session_id failed"));
+
+    // Verify VS proved identity over this session_id.
+    let vs_vk = VerifyingKey::from_bytes(&ja.vs_pub).context("bad vs_pub from JoinAccept")?;
+    let sig_ok = verify(&vs_vk, &ja.session_id, &ja.sig_vs);
+    if !sig_ok {
+        bail!("VS signature invalid on JoinAccept");
     }
 
     println!(
@@ -109,7 +109,8 @@ async fn main() -> Result<()> {
         ja.session_id,
     ));
 
-    let ticket_task = tokio::spawn(ticket_listener(conn.clone()));
+    // ticket_listener enforces signature / monotonic / hash chain.
+    let ticket_task = tokio::spawn(ticket_listener(conn.clone(), ja.session_id, vs_vk));
 
     if opts.test_once {
         // let a couple heartbeats/tickets flow then exit
@@ -118,8 +119,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // main task chills while background tasks run;
-    // if either ends, we log + exit.
+    // Stay alive while background tasks run; bail if either dies.
     loop {
         sleep(Duration::from_secs(60)).await;
         if hb_task.is_finished() || ticket_task.is_finished() {
@@ -175,29 +175,83 @@ async fn heartbeat_loop(
     Ok(())
 }
 
-async fn ticket_listener(conn: Connection) -> Result<()> {
+async fn ticket_listener(
+    conn: Connection,
+    session_id: [u8; 16],
+    vs_pub: VerifyingKey,
+) -> Result<()> {
+    // Track continuity so we can enforce freshness & prevent replay.
+    let mut last_counter: u64 = 0;
+    let mut last_hash: [u8; 32] = [0u8; 32];
+
     loop {
+        // VS opens a fresh bi-stream for each PlayTicket.
         let pair = conn.accept_bi().await;
-        if let Err(e) = pair {
-            eprintln!("[GS] accept_bi error: {e:?}");
+        let (send, mut recv) = match pair {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[GS] accept_bi error: {e:?}");
+                break;
+            }
+        };
+        drop(send); // GS doesn't send back on ticket streams.
+
+        let pt_res = recv_msg::<PlayTicket>(&mut recv).await;
+        let pt = match pt_res {
+            Ok(pt) => pt,
+            Err(e) => {
+                eprintln!("[GS] bad ticket: {e:?}");
+                continue;
+            }
+        };
+
+        // 1. session binding
+        if pt.session_id != session_id {
+            eprintln!("[GS] ticket session mismatch");
             break;
         }
 
-        let (send, mut recv) = pair.unwrap();
-        drop(send);
-
-        let pt_res = recv_msg::<PlayTicket>(&mut recv).await;
-        match pt_res {
-            Ok(pt) => {
-                let now = now_ms();
-                let ok_time = pt.not_before_ms.saturating_sub(500) <= now
-                    && now <= pt.not_after_ms.saturating_add(500);
-                println!("[GS] ticket #{} (time_ok={})", pt.counter, ok_time);
-            }
-            Err(e) => {
-                eprintln!("[GS] bad ticket: {e:?}");
-            }
+        // 2. counter monotonic
+        if pt.counter != last_counter + 1 {
+            eprintln!(
+                "[GS] ticket counter non-monotonic (got {}, expected {})",
+                pt.counter,
+                last_counter + 1
+            );
+            break;
         }
+
+        // 3. prev_ticket_hash continuity
+        if pt.prev_ticket_hash != last_hash {
+            eprintln!("[GS] ticket prev_hash mismatch");
+            break;
+        }
+
+        // 4. verify VS signature on the ticket body (minus sig_vs)
+        let body_tuple = (
+            pt.session_id,
+            pt.client_binding,
+            pt.counter,
+            pt.not_before_ms,
+            pt.not_after_ms,
+            pt.prev_ticket_hash,
+        );
+        let body_bytes = bincode::serialize(&body_tuple).context("ticket serialize")?;
+        if !verify(&vs_pub, &body_bytes, &pt.sig_vs) {
+            eprintln!("[GS] ticket sig_vs BAD");
+            break;
+        }
+
+        // 5. check freshness window
+        let now = now_ms();
+        let ok_time = pt.not_before_ms.saturating_sub(500) <= now
+            && now <= pt.not_after_ms.saturating_add(500);
+
+        println!("[GS] ticket #{} (time_ok={})", pt.counter, ok_time);
+
+        // 6. update continuity chain for next ticket
+        last_counter = pt.counter;
+        last_hash = sha256(&body_bytes);
     }
 
     Ok(())

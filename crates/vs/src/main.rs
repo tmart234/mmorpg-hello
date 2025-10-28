@@ -1,36 +1,35 @@
 //! vs: Validation Server
 //!
 //! Preruntime
-//!   - GS connects over QUIC.
-//!   - GS sends JoinRequest { gs_pub, sw_hash, t_unix_ms, nonce, sig_gs }.
-//!   - We verify sig_gs with gs_pub, check timestamp freshness,
-//!     (TODO) check sw_hash allowlist.
-//!   - We mint session_id, sign it with vs_sk, send JoinAccept { session_id, sig_vs }.
-//!   - We remember {session_id -> gs_pub, last_counter}.
+//!     - GS connects over QUIC.
+//!     - GS sends JoinRequest { gs_pub, sw_hash, t_unix_ms, nonce, sig_gs }.
+//!     - We verify sig_gs with gs_pub, check timestamp freshness,
+//!       (TODO) check sw_hash allowlist.
+//!     - We mint session_id, sign it with vs_sk, send JoinAccept { session_id, sig_vs, vs_pub }.
+//!     - We remember per-connection session state for runtime checks.
 //!
 //! Runtime
-//!   - heartbeat_reader():
-//!     GS -> VS bi-streams carrying Heartbeat {
-//!     session_id, gs_counter, gs_time_ms, receipt_tip, sig_gs
-//!     } every ~2s.
-//!     We verify sig_gs against stored gs_pub and enforce monotonic counter.
-//!     (TODO) liveness watchdog / teardown on stall.
+//!     - Heartbeats (GS -> VS):
+//!         GS opens a bi-stream every ~2s and sends Heartbeat {
+//!             session_id, gs_counter, gs_time_ms, receipt_tip, sig_gs
+//!         }.
+//!         We verify sig_gs using the gs_pub from join, enforce monotonic
+//!         counter, and record last_seen_ms. Watchdog will kill the conn
+//!         if heartbeats stop.
 //!
-//!   - ticket_sender():
-//!     VS -> GS bi-streams carrying PlayTicket every ~2s.
-//!     For now we fill placeholder fields and a dummy sig.
-//!     gs-sim just checks the time window and logs.
-//!
-//! Smoke test (`make ci`) proves:
-//!   - vs comes up on 127.0.0.1:4444
-//!   - gs-sim joins, gets a session, sends 2 heartbeats, reads tickets
-//!   - gs-sim exits cleanly with --test-once
-//!   - vs stays up.
+//!     - PlayTickets (VS -> GS):
+//!         VS opens a bi-stream every ~2s and sends PlayTicket {
+//!             session_id, client_binding, counter,
+//!             not_before_ms, not_after_ms,
+//!             prev_ticket_hash,
+//!             sig_vs
+//!         }.
+//!         gs-sim enforces monotonic counter, hash chaining, and sig_vs.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use common::{
-    crypto::{heartbeat_sign_bytes, join_request_sign_bytes, now_ms, sign, verify},
+    crypto::{heartbeat_sign_bytes, join_request_sign_bytes, now_ms, sha256, sign, verify},
     framing::{recv_msg, send_msg},
     proto::{Heartbeat, JoinAccept, JoinRequest, PlayTicket, Sig},
 };
@@ -39,28 +38,13 @@ use quinn::{Endpoint, ServerConfig};
 use rand::{rngs::OsRng, RngCore};
 use rcgen::generate_simple_self_signed;
 use std::{
-    collections::HashMap,
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{sync::Mutex, time::sleep};
-
-/// Max allowed clock skew between GS and VS during join (ms).
-/// This is our anti-replay window.
-const JOIN_MAX_SKEW_MS: u64 = 10_000; // 10s dev window
-
-/// Per-session state tracked on VS after join.
-#[derive(Clone)]
-struct SessionState {
-    gs_pub: VerifyingKey, // GS's ed25519 public key
-    last_counter: u64,    // last accepted heartbeat counter
-}
-
-/// Active sessions by session_id
-type Sessions = Arc<Mutex<HashMap<[u8; 16], SessionState>>>;
+use tokio::time::sleep;
 
 #[derive(Parser, Debug)]
 struct Opts {
@@ -80,13 +64,11 @@ struct Opts {
 async fn main() -> Result<()> {
     let opts = Opts::parse();
 
-    let (vs_sk_raw, vs_pk_raw) = load_or_make_keys(&opts.vs_sk, &opts.vs_pk)?;
+    // Ensure VS has a signing keypair; we only actually *use* the secret.
+    let (vs_sk_raw, _vs_pk_raw) = load_or_make_keys(&opts.vs_sk, &opts.vs_pk)?;
     let vs_sk = Arc::new(vs_sk_raw);
-    let vs_pk = Arc::new(vs_pk_raw);
 
-    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
-
-    // Spin up QUIC listener with a self-signed cert
+    // Spin up QUIC listener with a self-signed cert.
     let (endpoint, _local_addr) = make_endpoint(&opts.bind)?;
     println!("[VS] listening on {}", opts.bind);
 
@@ -99,12 +81,9 @@ async fn main() -> Result<()> {
         };
 
         let vs_sk_clone = vs_sk.clone();
-        let vs_pk_clone = vs_pk.clone();
-        let sessions_clone = sessions.clone();
+
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_connection(connecting, vs_sk_clone, vs_pk_clone, sessions_clone).await
-            {
+            if let Err(e) = handle_connection(connecting, vs_sk_clone).await {
                 eprintln!("[VS] conn error: {e:?}");
             }
         });
@@ -113,21 +92,19 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Handle exactly one GS QUIC connection:
-/// - Finish join handshake on first bi-stream.
-/// - Register session in Sessions map.
-/// - Spawn heartbeat_reader (VS <- GS) and ticket_sender (VS -> GS).
-async fn handle_connection(
-    connecting: quinn::Connecting,
-    vs_sk: Arc<SigningKey>,
-    vs_pk: Arc<VerifyingKey>,
-    sessions: Sessions,
-) -> Result<()> {
-    // Finish QUIC handshake -> live Connection
+/// Per-connection lifecycle:
+/// - Complete join handshake
+/// - Track session state (pubkey, counters, last_seen)
+/// - Spawn:
+///     * ticket loop (VS -> GS)
+///     * heartbeat validator (GS -> VS)
+///     * watchdog
+async fn handle_connection(connecting: quinn::Connecting, vs_sk: Arc<SigningKey>) -> Result<()> {
+    // === 1. Finish QUIC handshake ===
     let conn = connecting.await.context("handshake accept")?;
     println!("[VS] new conn from {}", conn.remote_address());
 
-    // First bi-stream: GS sends JoinRequest, expects JoinAccept back.
+    // First bi-stream from GS carries JoinRequest. We must read that and respond.
     let (mut vs_send, mut vs_recv) = conn
         .accept_bi()
         .await
@@ -136,251 +113,229 @@ async fn handle_connection(
     let jr: JoinRequest = recv_msg(&mut vs_recv).await.context("recv JoinRequest")?;
     println!("[VS] got JoinRequest from gs_id={}", jr.gs_id);
 
-    // ---- Preruntime validation ----
+    // === 2. Validate JoinRequest ===
 
-    // 1. Verify JoinRequest signature.
-    let jr_msg = join_request_sign_bytes(&jr.gs_id, &jr.sw_hash, jr.t_unix_ms, &jr.nonce);
-
-    let gs_pub = VerifyingKey::from_bytes(&jr.gs_pub).context("bad gs_pub len")?;
-    if !verify(&gs_pub, &jr_msg, &jr.sig_gs) {
-        return Err(anyhow!("JoinRequest sig_gs invalid"));
+    // 2a. Signature proves caller controls jr.gs_pub.
+    let gs_vk = VerifyingKey::from_bytes(&jr.gs_pub).context("bad gs_pub")?;
+    let join_bytes = join_request_sign_bytes(&jr.gs_id, &jr.sw_hash, jr.t_unix_ms, &jr.nonce);
+    if !verify(&gs_vk, &join_bytes, &jr.sig_gs) {
+        bail!("JoinRequest sig_gs invalid");
     }
 
-    // 2. Anti-replay freshness check.
+    // 2b. Anti-replay freshness: timestamp skew must be small.
     let now = now_ms();
     let skew = now.abs_diff(jr.t_unix_ms);
-    if skew > JOIN_MAX_SKEW_MS {
-        return Err(anyhow!(
-            "JoinRequest timestamp skew too large ({} ms)",
-            skew
-        ));
+    if skew > 5_000 {
+        bail!("JoinRequest timestamp skew too large: {skew} ms");
     }
 
-    // 3. Placeholder "attestation" policy:
-    //    In prod we'd compare jr.sw_hash against an allowlist of known builds.
-    let _allowed = true;
-    if !_allowed {
-        return Err(anyhow!("JoinRequest sw_hash not allowed"));
-    }
+    // 2c. (TODO) sw_hash allowlist.
+    // Intentionally skipped in this dev build to keep clippy happy.
+    // We'll reintroduce this with real allowlist data.
 
-    // 4. Mint session_id and sign it with VS key.
+    // === 3. Create session state ===
+
+    // Random session_id that will bind this GS identity for runtime checks.
     let mut session_id = [0u8; 16];
     OsRng.fill_bytes(&mut session_id);
 
-    let sig_vs: Sig = sign(vs_sk.as_ref(), &session_id);
+    // State we track for heartbeats (liveness + monotonic counter).
+    // Arc<Mutex<...>> so validator + watchdog can share.
+    #[derive(Clone)]
+    struct SessionState {
+        gs_pub: [u8; 32],
+        last_counter: u64,
+        last_seen_ms: u64,
+    }
+    let state = Arc::new(Mutex::new(SessionState {
+        gs_pub: jr.gs_pub,
+        last_counter: 0,
+        last_seen_ms: now_ms(),
+    }));
 
+    // === 4. Send JoinAccept back to GS ===
+
+    // sig_vs = VS signing the session_id so GS can pin VS identity.
+    let sig_vs: Sig = sign(vs_sk.as_ref(), &session_id);
     let ja = JoinAccept {
         session_id,
         sig_vs,
-        vs_pub: vs_pk.to_bytes(),
+        vs_pub: vs_sk.verifying_key().to_bytes(),
     };
 
-    // Send JoinAccept back on same stream.
     send_msg(&mut vs_send, &ja)
         .await
         .context("send JoinAccept")?;
 
-    println!(
-        "[VS] accepted gs_id={} session={}..",
-        jr.gs_id,
-        hex::encode(&session_id[..4])
-    );
+    // === 5. Spawn runtime tasks for this connection ===
 
-    // Remember this GS for runtime checks.
+    // 5a. VS -> GS ticket loop:
+    //     Send a fresh, signed PlayTicket every ~2s.
     {
-        let mut guard = sessions.lock().await;
-        guard.insert(
-            session_id,
-            SessionState {
-                gs_pub,
-                last_counter: 0,
-            },
-        );
+        let conn = conn.clone();
+        let vs_sk = vs_sk.clone();
+        let session_id = session_id;
+        tokio::spawn(async move {
+            let mut counter: u64 = 0;
+            let mut prev_hash: [u8; 32] = [0u8; 32];
+
+            loop {
+                sleep(Duration::from_secs(2)).await;
+
+                counter += 1;
+                let now = now_ms();
+                let not_before = now;
+                let not_after = now + 2_000;
+
+                // Body we're signing (everything except sig_vs).
+                let body_tuple = (
+                    session_id, [0u8; 32], // client_binding placeholder for now
+                    counter, not_before, not_after, prev_hash,
+                );
+
+                let body_bytes = match bincode::serialize(&body_tuple) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("[VS] ticket serialize failed: {e:?}");
+                        break;
+                    }
+                };
+
+                // VS signs ticket body.
+                let sig_vs: Sig = sign(vs_sk.as_ref(), &body_bytes);
+
+                let pt = PlayTicket {
+                    session_id,
+                    client_binding: [0u8; 32],
+                    counter,
+                    not_before_ms: not_before,
+                    not_after_ms: not_after,
+                    prev_ticket_hash: prev_hash,
+                    sig_vs,
+                };
+
+                // Prepare hash chain for next ticket.
+                prev_hash = sha256(&body_bytes);
+
+                // Send ticket on a fresh bi-stream.
+                match conn.open_bi().await {
+                    Ok((mut send, _recv)) => {
+                        if let Err(e) = send_msg(&mut send, &pt).await {
+                            eprintln!("[VS] send PlayTicket failed: {e:?}");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[VS] open_bi for PlayTicket failed: {e:?}");
+                        break;
+                    }
+                }
+            }
+        });
     }
 
-    // Spawn runtime tasks and return. The tasks hold cloned Arcs
-    // so the connection stays alive.
-    let conn_for_hb = conn.clone();
-    let sessions_for_hb = sessions.clone();
-    let session_id_for_hb = session_id;
-    tokio::spawn(async move {
-        if let Err(e) = heartbeat_reader(conn_for_hb, session_id_for_hb, sessions_for_hb).await {
-            eprintln!("[VS] heartbeat_reader error: {e:?}");
-        }
-    });
+    // 5b. GS -> VS heartbeat validator:
+    //     Accept bi-streams, read Heartbeat, verify sig_gs, enforce monotonic counter,
+    //     update last_seen_ms.
+    {
+        let conn = conn.clone();
+        let state = state.clone();
+        let session_id = session_id;
+        tokio::spawn(async move {
+            loop {
+                // GS opens a fresh bi-stream for each heartbeat.
+                let pair = conn.accept_bi().await;
+                let (send, mut recv) = match pair {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("[VS] accept_bi heartbeat error: {e:?}");
+                        break;
+                    }
+                };
+                drop(send); // VS doesn't send anything back on this stream (yet).
 
-    let conn_for_ticket = conn.clone();
-    let session_id_for_ticket = session_id;
-    tokio::spawn(async move {
-        if let Err(e) = ticket_sender(conn_for_ticket, session_id_for_ticket).await {
-            eprintln!("[VS] ticket_sender error: {e:?}");
-        }
-    });
+                let hb_res = recv_msg::<Heartbeat>(&mut recv).await;
+                let hb = match hb_res {
+                    Ok(hb) => hb,
+                    Err(e) => {
+                        eprintln!("[VS] bad Heartbeat decode: {e:?}");
+                        continue;
+                    }
+                };
 
-    Ok(())
-}
+                // Validate heartbeat.
+                let mut st = state.lock().unwrap();
 
-/// Read heartbeats from GS.
-/// Each heartbeat bi-stream should contain exactly one Heartbeat.
-/// We verify sig_gs and counter monotonicity.
-async fn heartbeat_reader(
-    conn: quinn::Connection,
-    session_id: [u8; 16],
-    sessions: Sessions,
-) -> Result<()> {
-    loop {
-        let pair = conn.accept_bi().await;
-        let (mut _send, mut recv) = match pair {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!(
-                    "[VS] heartbeat accept_bi error (session {}..): {e:?}",
-                    hex::encode(&session_id[..4])
+                // Must match this session.
+                if hb.session_id != session_id {
+                    eprintln!("[VS] heartbeat session mismatch");
+                    continue;
+                }
+
+                // Counter must strictly increase.
+                if hb.gs_counter <= st.last_counter {
+                    eprintln!(
+                        "[VS] heartbeat non-monotonic (got {}, last {})",
+                        hb.gs_counter, st.last_counter
+                    );
+                    continue;
+                }
+
+                // Signature must verify against the gs_pub we saw at join.
+                let gs_vk = match VerifyingKey::from_bytes(&st.gs_pub) {
+                    Ok(vk) => vk,
+                    Err(e) => {
+                        eprintln!("[VS] stored gs_pub invalid: {e:?}");
+                        break;
+                    }
+                };
+
+                let hb_bytes = heartbeat_sign_bytes(
+                    &hb.session_id,
+                    hb.gs_counter,
+                    hb.gs_time_ms,
+                    &hb.receipt_tip,
                 );
-                break;
+                if !verify(&gs_vk, &hb_bytes, &hb.sig_gs) {
+                    eprintln!("[VS] heartbeat sig BAD");
+                    continue;
+                }
+
+                // Passed all checks → record liveness.
+                st.last_counter = hb.gs_counter;
+                st.last_seen_ms = now_ms();
             }
-        };
-
-        // We don't send anything back on this heartbeat stream.
-        drop(_send);
-
-        let hb_res = recv_msg::<Heartbeat>(&mut recv).await;
-        let hb = match hb_res {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!(
-                    "[VS] heartbeat decode error (session {}..): {e:?}",
-                    hex::encode(&session_id[..4])
-                );
-                continue;
-            }
-        };
-
-        // Session must match
-        if hb.session_id != session_id {
-            eprintln!(
-                "[VS] heartbeat wrong session id {}.. (expected {}..)",
-                hex::encode(&hb.session_id[..4]),
-                hex::encode(&session_id[..4]),
-            );
-            continue;
-        }
-
-        // Look up session state to get gs_pub / last_counter.
-        let mut guard = sessions.lock().await;
-        let st = match guard.get_mut(&session_id) {
-            Some(s) => s,
-            None => {
-                eprintln!(
-                    "[VS] heartbeat for unknown/expired session {}..",
-                    hex::encode(&session_id[..4])
-                );
-                continue;
-            }
-        };
-
-        // Verify sig_gs on heartbeat.
-        let hb_msg = heartbeat_sign_bytes(
-            &hb.session_id,
-            hb.gs_counter,
-            hb.gs_time_ms,
-            &hb.receipt_tip,
-        );
-        if !verify(&st.gs_pub, &hb_msg, &hb.sig_gs) {
-            eprintln!(
-                "[VS] BAD heartbeat sig (session {}..)",
-                hex::encode(&session_id[..4])
-            );
-            continue;
-        }
-
-        // Enforce monotonic counter.
-        if hb.gs_counter <= st.last_counter {
-            eprintln!(
-                "[VS] non-monotonic counter {} (last {}) for session {}..",
-                hb.gs_counter,
-                st.last_counter,
-                hex::encode(&session_id[..4])
-            );
-            continue;
-        }
-        st.last_counter = hb.gs_counter;
-
-        // TODO: watchdog if heartbeats stop.
-        println!(
-            "[VS] hb ok c={} from session {}..",
-            hb.gs_counter,
-            hex::encode(&session_id[..4])
-        );
+        });
     }
 
-    Ok(())
-}
-
-/// Send PlayTickets to GS every ~2s.
-/// VS opens a fresh bi-stream for each ticket.
-///
-/// We currently fill placeholder fields so gs-sim can deserialize.
-async fn ticket_sender(conn: quinn::Connection, session_id: [u8; 16]) -> Result<()> {
-    let mut counter: u64 = 0;
-
-    // Chaining / binding placeholders
-    let client_binding = [0u8; 32];
-    let mut prev_ticket_hash = [0u8; 32];
-
-    loop {
-        sleep(Duration::from_secs(2)).await;
-        counter += 1;
-
-        let now = now_ms();
-
-        // Dummy sig_vs for now. We'll replace this with a real
-        // vs_sk signature once we define ticket_sign_bytes().
-        let sig_vs: Sig = [0u8; 64];
-
-        // Fill the whole struct so it matches common::proto::PlayTicket.
-        let pt = PlayTicket {
-            session_id,
-            client_binding,
-            prev_ticket_hash,
-            counter,
-            not_before_ms: now,
-            not_after_ms: now + 2_000,
-            sig_vs,
-        };
-
-        // Open a bi-stream to send the ticket.
-        let pair = conn.open_bi().await;
-        let (mut send, _recv) = match pair {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!(
-                    "[VS] ticket open_bi failed (session {}..): {e:?}",
-                    hex::encode(&session_id[..4])
-                );
-                break;
+    // 5c. Watchdog:
+    //     If we haven't seen a valid heartbeat in >5s, close this QUIC connection.
+    {
+        let conn = conn.clone();
+        let state = state.clone();
+        let session_id = session_id;
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(1)).await;
+                let last_seen_ms = {
+                    let st = state.lock().unwrap();
+                    st.last_seen_ms
+                };
+                let idle_ms = now_ms().saturating_sub(last_seen_ms);
+                if idle_ms > 5_000 {
+                    eprintln!(
+                        "[VS] heartbeat timeout for session {}.. ({} ms idle) -> closing",
+                        hex::encode(&session_id[..4]),
+                        idle_ms
+                    );
+                    conn.close(0u32.into(), b"heartbeat timeout");
+                    break;
+                }
             }
-        };
-
-        if let Err(e) = send_msg(&mut send, &pt).await {
-            eprintln!(
-                "[VS] ticket send failed (session {}..): {e:?}",
-                hex::encode(&session_id[..4])
-            );
-        } else {
-            println!(
-                "[VS] sent ticket #{} to session {}..",
-                counter,
-                hex::encode(&session_id[..4])
-            );
-        }
-
-        // TODO: once we define how prev_ticket_hash is computed
-        // (probably sha256 of the serialized ticket), update it here:
-        // prev_ticket_hash = sha256(serialized_pt);
-        let _ = &mut prev_ticket_hash;
+        });
     }
 
+    // Done setting up; background tasks own the connection from here.
     Ok(())
 }
 
@@ -413,7 +368,7 @@ fn make_endpoint(bind: &str) -> Result<(Endpoint, SocketAddr)> {
     };
     let local_addr = SocketAddr::new(bind_ip, req_addr.port());
 
-    // Launch QUIC server endpoint
+    // Launch QUIC server endpoint.
     let endpoint = Endpoint::server(server_cfg, local_addr).context("Endpoint::server")?;
 
     Ok((endpoint, local_addr))
