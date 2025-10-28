@@ -10,7 +10,9 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-pub fn rand_u128() -> u128 { rand::random::<u128>() }
+pub fn rand_u128() -> u128 {
+    rand::random::<u128>()
+}
 
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut h = Sha2::new();
@@ -25,7 +27,9 @@ pub fn file_sha256(path: &std::path::Path) -> std::io::Result<[u8; 32]> {
     let mut buf = [0u8; 8192];
     loop {
         let n = f.read(&mut buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         h.update(&buf[..n]);
     }
     Ok(h.finalize().into())
@@ -33,7 +37,7 @@ pub fn file_sha256(path: &std::path::Path) -> std::io::Result<[u8; 32]> {
 
 pub fn gen_ed25519() -> (SigningKey, VerifyingKey) {
     let sk = SigningKey::generate(&mut OsRng);
-    let vk = sk.verifying_key();  // compute before moving sk
+    let vk = sk.verifying_key(); // compute before moving sk
     (sk, vk)
 }
 
@@ -46,10 +50,20 @@ pub fn verify(pk: &VerifyingKey, msg: &[u8], sig: &[u8; 64]) -> bool {
     pk.verify(msg, &Signature::from_bytes(sig)).is_ok()
 }
 
-pub fn join_request_sign_bytes(gs_id: &str, sw_hash: &[u8; 32], t_unix_ms: u64, nonce: &[u8; 16]) -> Vec<u8> {
+pub fn join_request_sign_bytes(
+    gs_id: &str,
+    sw_hash: &[u8; 32],
+    t_unix_ms: u64,
+    nonce: &[u8; 16],
+) -> Vec<u8> {
     bincode::serialize(&(gs_id, sw_hash, t_unix_ms, nonce)).unwrap()
 }
 
-pub fn heartbeat_sign_bytes(session_id: &[u8; 16], gs_counter: u64, gs_time_ms: u64, receipt_tip: &[u8; 32]) -> Vec<u8> {
+pub fn heartbeat_sign_bytes(
+    session_id: &[u8; 16],
+    gs_counter: u64,
+    gs_time_ms: u64,
+    receipt_tip: &[u8; 32],
+) -> Vec<u8> {
     bincode::serialize(&(session_id, gs_counter, gs_time_ms, receipt_tip)).unwrap()
 }

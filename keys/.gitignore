@@ -1,4 +1,4 @@
 *.pk8
-!*.pub
+*.pub
 *.der
 *.pem

@@ -7,6 +7,13 @@ edition = "2021"
 name = "gen_keys"
 path = "src/gen_keys.rs"
 
+[[bin]]
+name = "smoke"
+path = "src/smoke.rs"
+
 [dependencies]
+clap = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
+
+anyhow = { workspace = true }

@@ -4,19 +4,18 @@
 //! - Sends signed heartbeats
 //! - Listens for PlayTickets
 
-use anyhow::*;
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use common::{
     crypto::{file_sha256, heartbeat_sign_bytes, join_request_sign_bytes, now_ms, sign},
     framing::{recv_msg, send_msg},
     proto::{Heartbeat, JoinAccept, JoinRequest, PlayTicket, Sig},
 };
-
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use quinn::{ClientConfig, Endpoint};
+use quinn::{ClientConfig, Connection, Endpoint};
 use rand::{rngs::OsRng, RngCore};
 use std::{
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -24,7 +23,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::time::sleep;
+use tokio::time::sleep; // for hex::encode
 
 #[derive(Parser, Debug)]
 struct Opts {
@@ -32,18 +31,17 @@ struct Opts {
     #[arg(long, default_value = "127.0.0.1:4444")]
     vs: String,
 
-    /// One-shot test: exit after first join + heartbeat + ticket
+    /// Exit after first join/heartbeat/ticket
     #[arg(long)]
     test_once: bool,
 
-    /// GS ID label
+    /// Logical GS ID label
     #[arg(long, default_value = "gs-sim-local")]
     gs_id: String,
 
-    /// Path to GS ed25519 private key (generated if missing)
+    /// Paths to GS keypair
     #[arg(long, default_value = "keys/gs_ed25519.pk8")]
     gs_sk: String,
-    /// Path to GS ed25519 public key (generated if missing)
     #[arg(long, default_value = "keys/gs_ed25519.pub")]
     gs_pk: String,
 }
@@ -52,32 +50,32 @@ struct Opts {
 async fn main() -> Result<()> {
     let opts = Opts::parse();
 
-    // Load or generate GS keypair
+    // Load or generate GS signing keypair
     let (gs_sk, gs_pk) = load_or_make_keys(&opts.gs_sk, &opts.gs_pk)?;
 
-    // Compute a dev-level "attestation" hash of this binary
+    // Compute a dev "attestation" hash of this binary
     let exe = std::env::current_exe()?;
     let sw_hash = file_sha256(&exe)?;
 
-    // QUIC client endpoint (dev: permissive cert verify)
-    let (endpoint, server_addr) = make_endpoint_and_addr(&opts.vs).await?;
-
-    // Connect to VS
-    let conn = endpoint
+    // Create a QUIC client Endpoint + connect to VS
+    let (endpoint, server_addr) = make_endpoint_and_addr(&opts.vs)?;
+    let conn: Connection = endpoint
         .connect_with(make_client_cfg_insecure()?, server_addr, "vs.dev")?
-        .await?;
+        .await?; // <-- unwrap Result<Connection, ConnectionError>
     println!("[GS] connected to VS at {server_addr}");
 
-    // 1) Send JoinRequest on a fresh bi-stream
+    // ---- Send JoinRequest on a fresh bi-stream ----
     let mut nonce = [0u8; 16];
     OsRng.fill_bytes(&mut nonce);
-    let join_sig_bytes = join_request_sign_bytes(&opts.gs_id, &sw_hash, now_ms(), &nonce);
-    let sig_gs: Sig = sign(&gs_sk, &join_sig_bytes);
+
+    let now = now_ms();
+    let to_sign = join_request_sign_bytes(&opts.gs_id, &sw_hash, now, &nonce);
+    let sig_gs: Sig = sign(&gs_sk, &to_sign);
 
     let jr = JoinRequest {
         gs_id: opts.gs_id.clone(),
         sw_hash,
-        t_unix_ms: now_ms(),
+        t_unix_ms: now,
         nonce,
         sig_gs,
         gs_pub: gs_pk.to_bytes(),
@@ -87,48 +85,59 @@ async fn main() -> Result<()> {
     send_msg(&mut jsend, &jr).await?;
     let ja: JoinAccept = recv_msg(&mut jrecv).await?;
     println!(
-        "[GS] joined. session_id={}.., valid {}..{}",
+        "[GS] joined. session_id={}.. (vs sig ok = {} bytes)",
         hex::encode(&ja.session_id[..4]),
-        ja.not_before_ms,
-        ja.not_after_ms
+        ja.sig_vs.len()
     );
 
-    // 2) Spawn heartbeat loop
+    // ---- Background tasks ----
     let hb_counter = Arc::new(AtomicU64::new(0));
     let hb_task = tokio::spawn(heartbeat_loop(
         conn.clone(),
         hb_counter.clone(),
-        &gs_sk,
+        gs_sk.clone(),
         ja.session_id,
     ));
 
-    // 3) Listen for PlayTickets (server-initiated streams)
     let ticket_task = tokio::spawn(ticket_listener(conn.clone()));
 
     if opts.test_once {
-        // Allow a couple of heartbeats/tickets then exit
+        // let a couple heartbeats/tickets flow then exit
         sleep(Duration::from_secs(5)).await;
         println!("[GS] test_once complete.");
         return Ok(());
     }
 
-    // Keep running
-    tokio::try_join!(hb_task, ticket_task).map(|_| ())
+    // main task just hangs out while background tasks run;
+    // if either dies, bail.
+    loop {
+        sleep(Duration::from_secs(60)).await;
+        if hb_task.is_finished() || ticket_task.is_finished() {
+            eprintln!("[GS] background task ended, exiting main loop");
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 async fn heartbeat_loop(
-    conn: quinn::Connection,
+    conn: Connection,
     counter: Arc<AtomicU64>,
-    gs_sk: &SigningKey,
+    gs_sk: SigningKey,
     session_id: [u8; 16],
 ) -> Result<()> {
-    let mut receipt_tip = [0u8; 32]; // none yet
+    let receipt_tip = [0u8; 32]; // no receipts yet
+
     loop {
         sleep(Duration::from_secs(2)).await;
+
         let c = counter.fetch_add(1, Ordering::SeqCst) + 1;
         let now = now_ms();
+
         let to_sign = heartbeat_sign_bytes(&session_id, c, now, &receipt_tip);
-        let sig_gs = sign(gs_sk, &to_sign);
+        let sig_gs = sign(&gs_sk, &to_sign);
+
         let hb = Heartbeat {
             session_id,
             gs_counter: c,
@@ -136,53 +145,61 @@ async fn heartbeat_loop(
             receipt_tip,
             sig_gs,
         };
-        let (mut send, _recv) = conn.open_bi().await?;
+
+        // open a new bi-stream for each heartbeat
+        let pair = conn.open_bi().await;
+        if let Err(e) = pair {
+            eprintln!("[GS] heartbeat open_bi failed: {e:?}");
+            break;
+        }
+        let (mut send, _recv) = pair.unwrap();
+
         if let Err(e) = send_msg(&mut send, &hb).await {
             eprintln!("[GS] heartbeat send failed: {e:?}");
         } else {
             println!("[GS] ♥ heartbeat {}", c);
         }
     }
-}
 
-async fn ticket_listener(conn: quinn::Connection) -> Result<()> {
-    let mut incoming = conn.accept_bi();
-    loop {
-        match incoming.await {
-            Ok(Some((mut send, mut recv))) => {
-                drop(send); // not replying on this stream
-                match recv_msg::<PlayTicket>(&mut recv).await {
-                    Ok(pt) => {
-                        let ok_time = pt.not_before_ms.saturating_sub(500) <= now_ms()
-                            && now_ms() <= pt.not_after_ms.saturating_add(500);
-                        println!("[GS] ticket #{} (time_ok={})", pt.counter, ok_time);
-                    }
-                    Err(e) => {
-                        eprintln!("[GS] bad ticket: {e:?}");
-                    }
-                }
-                incoming = conn.accept_bi(); // continue loop
-            }
-            Ok(None) => {
-                eprintln!("[GS] VS closed connection.");
-                break;
-            }
-            Err(e) => {
-                eprintln!("[GS] accept_bi error: {e:?}");
-                break;
-            }
-        }
-    }
     Ok(())
 }
 
-/// Load ed25519 keypair from disk or create new.
+async fn ticket_listener(conn: Connection) -> Result<()> {
+    loop {
+        let pair = conn.accept_bi().await;
+        if let Err(e) = pair {
+            eprintln!("[GS] accept_bi error: {e:?}");
+            break;
+        }
+
+        let (send, mut recv) = pair.unwrap();
+        drop(send);
+        let pt_res = recv_msg::<PlayTicket>(&mut recv).await;
+        match pt_res {
+            Ok(pt) => {
+                let now = now_ms();
+                let ok_time = pt.not_before_ms.saturating_sub(500) <= now
+                    && now <= pt.not_after_ms.saturating_add(500);
+                println!("[GS] ticket #{} (time_ok={})", pt.counter, ok_time);
+            }
+            Err(e) => {
+                eprintln!("[GS] bad ticket: {e:?}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Load ed25519 keypair from disk or create new dev keys.
 fn load_or_make_keys(sk_path: &str, pk_path: &str) -> Result<(SigningKey, VerifyingKey)> {
     let skp = PathBuf::from(sk_path);
     let pkp = PathBuf::from(pk_path);
+
     if skp.exists() && pkp.exists() {
         let sk_bytes = std::fs::read(&skp)?;
         let pk_bytes = std::fs::read(&pkp)?;
+
         let sk = SigningKey::from_bytes(
             &sk_bytes
                 .try_into()
@@ -209,13 +226,13 @@ fn load_or_make_keys(sk_path: &str, pk_path: &str) -> Result<(SigningKey, Verify
     }
 }
 
-/// Dev-only: accept any server cert. Replace with proper pinning once VS serves a real cert.
+/// Dev-only: accept any server cert. Replace with real pinning for prod.
 fn make_client_cfg_insecure() -> Result<ClientConfig> {
     use rustls::{
-        client::{ServerCertVerified, ServerCertVerifier},
+        client::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
         Certificate, ClientConfig as RustlsClientConfig, DigitallySignedStruct, ServerName,
     };
-    use std::{sync::Arc, time::SystemTime};
+    use std::time::SystemTime;
 
     struct NoVerify;
     impl ServerCertVerifier for NoVerify {
@@ -225,43 +242,62 @@ fn make_client_cfg_insecure() -> Result<ClientConfig> {
             _intermediates: &[Certificate],
             _server_name: &ServerName,
             _scts: &mut dyn Iterator<Item = &[u8]>,
-            _ocsp: &[u8],
+            _ocsp_response: &[u8],
             _now: SystemTime,
         ) -> std::result::Result<ServerCertVerified, rustls::Error> {
             Ok(ServerCertVerified::assertion())
         }
+
         fn verify_tls12_signature(
             &self,
             _message: &[u8],
             _cert: &Certificate,
             _dss: &DigitallySignedStruct,
-        ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-            Ok(ServerCertVerified::assertion())
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
         }
+
         fn verify_tls13_signature(
             &self,
             _message: &[u8],
             _cert: &Certificate,
             _dss: &DigitallySignedStruct,
-        ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-            Ok(ServerCertVerified::assertion())
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
         }
     }
 
-    let mut cfg = RustlsClientConfig::builder()
+    let tls_cfg = RustlsClientConfig::builder()
         .with_safe_defaults()
         .with_custom_certificate_verifier(Arc::new(NoVerify))
         .with_no_client_auth();
-    cfg.enable_early_data = true;
-    Ok(ClientConfig::new(Arc::new(cfg)))
+
+    Ok(ClientConfig::new(Arc::new(tls_cfg)))
 }
 
-async fn make_endpoint_and_addr(vs: &str) -> Result<(Endpoint, SocketAddr)> {
-    // Bind an ephemeral UDP port (IPv6 dual-stack OK)
-    let bind_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
-    let endpoint = Endpoint::client(bind_addr)?;
-    let server_addr: SocketAddr = vs
-        .parse()
-        .with_context(|| format!("bad vs address: {vs}"))?;
+/// Create a Quinn client Endpoint bound to an ephemeral UDP port,
+/// choosing IPv4 vs IPv6 family to match the VS address.
+fn make_endpoint_and_addr(vs: &str) -> Result<(Endpoint, SocketAddr)> {
+    use quinn::{EndpointConfig, TokioRuntime};
+
+    let server_addr: SocketAddr = vs.parse().context("bad vs address")?;
+
+    // Bind locally on same IP family as the server
+    let bind_ip = match server_addr {
+        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    let local_addr = SocketAddr::new(bind_ip, 0);
+
+    let udp = UdpSocket::bind(local_addr)?;
+    udp.set_nonblocking(true)?;
+
+    let endpoint = Endpoint::new(
+        EndpointConfig::default(),
+        None, // client-only Endpoint, no server config
+        udp,
+        Arc::new(TokioRuntime),
+    )?;
+
     Ok((endpoint, server_addr))
 }
