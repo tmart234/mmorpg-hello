@@ -14,11 +14,7 @@ edition = "2021"
 anyhow = "1.0"
 tokio = { version = "1.48", features = ["full"] }
 
-# Quinn 0.10.2, with the right feature flags:
-# - runtime-tokio: gives us quinn::TokioRuntime
-# - tls-rustls: gives us quinn::rustls and ServerConfig::with_single_cert
-# - ring: crypto backend
-quinn = { version = "0.10.2", default-features = false, features = ["runtime-tokio", "tls-rustls", "ring"] }
+quinn = { version = "0.10.2", features = ["runtime-tokio", "tls-rustls", "ring"] }
 
 # rustls, with "dangerous_configuration" so we can provide a custom cert verifier
 rustls = { version = "0.21", features = ["dangerous_configuration"] }
