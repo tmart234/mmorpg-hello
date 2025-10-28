@@ -50,13 +50,17 @@ pub fn verify(pk: &VerifyingKey, msg: &[u8], sig: &[u8; 64]) -> bool {
     pk.verify(msg, &Signature::from_bytes(sig)).is_ok()
 }
 
+/// VS will verify this signature using gs_pub, and then trust that
+/// `ephemeral_pub` belongs to this GS session. After that, all heartbeats
+/// are expected to be signed with the ephemeral key, not the long-term key.
 pub fn join_request_sign_bytes(
     gs_id: &str,
     sw_hash: &[u8; 32],
     t_unix_ms: u64,
     nonce: &[u8; 16],
+    ephemeral_pub: &[u8; 32],
 ) -> Vec<u8> {
-    bincode::serialize(&(gs_id, sw_hash, t_unix_ms, nonce)).unwrap()
+    bincode::serialize(&(gs_id, sw_hash, t_unix_ms, nonce, ephemeral_pub)).unwrap()
 }
 
 pub fn heartbeat_sign_bytes(

@@ -1,8 +1,9 @@
 //! gs-sim: minimal untrusted Game Server simulator
 //! - Attests its binary hash (dev-level)
-//! - Joins VS
-//! - Sends signed heartbeats
-//! - Listens for PlayTickets
+//! - Joins VS with both long-term GS key and a fresh per-session ephemeral key
+//! - Sends signed heartbeats using the ephemeral session key
+//! - Listens for PlayTickets from VS, verifies them, caches latest
+//! - (new) mock client-input gate: require fresh PlayTicket from VS
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
@@ -25,7 +26,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::time::sleep;
+use tokio::{sync::Mutex, time::sleep};
 
 #[derive(Parser, Debug)]
 struct Opts {
@@ -41,7 +42,7 @@ struct Opts {
     #[arg(long, default_value = "gs-sim-local")]
     gs_id: String,
 
-    /// Paths to GS keypair
+    /// Paths to GS long-term keypair
     #[arg(long, default_value = "keys/gs_ed25519.pk8")]
     gs_sk: String,
     #[arg(long, default_value = "keys/gs_ed25519.pub")]
@@ -52,26 +53,42 @@ struct Opts {
 async fn main() -> Result<()> {
     let opts = Opts::parse();
 
-    // Load or generate GS signing keypair.
+    // --- 1. Load or generate GS long-term identity keypair ---
     let (gs_sk, gs_pk) = load_or_make_keys(&opts.gs_sk, &opts.gs_pk)?;
 
-    // Compute dev "attestation" hash of this binary.
+    // --- 2. Generate fresh per-session ephemeral keypair ---
+    // This one is NOT persisted. It lives only for this VS session.
+    let eph_sk = SigningKey::generate(&mut OsRng);
+    let eph_pk = eph_sk.verifying_key();
+    let eph_pub_bytes = eph_pk.to_bytes(); // [u8;32]
+
+    // --- 3. Compute dev "attestation" hash of this running binary ---
     let exe = std::env::current_exe()?;
     let sw_hash = file_sha256(&exe)?;
 
-    // QUIC client endpoint + connect to VS.
+    // --- 4. QUIC client endpoint + connect to VS ---
     let (endpoint, server_addr) = make_endpoint_and_addr(&opts.vs)?;
     let conn: Connection = endpoint
         .connect_with(make_client_cfg_insecure()?, server_addr, "vs.dev")?
         .await?;
     println!("[GS] connected to VS at {server_addr}");
 
-    // ---- Send JoinRequest on a fresh bi-stream ----
+    // --- 5. Build and send JoinRequest on fresh bi-stream ---
     let mut nonce = [0u8; 16];
     OsRng.fill_bytes(&mut nonce);
 
     let now = now_ms();
-    let to_sign = join_request_sign_bytes(&opts.gs_id, &sw_hash, now, &nonce);
+
+    // The JoinRequest is authenticated by the *long-term* GS key.
+    // The signed message includes the ephemeral_pub, so VS learns:
+    // "This GS identity vouches that this ephemeral key is legit for this session."
+    let to_sign = join_request_sign_bytes(
+        &opts.gs_id,
+        &sw_hash,
+        now,
+        &nonce,
+        &eph_pub_bytes, // new extra param
+    );
     let sig_gs: Sig = sign(&gs_sk, &to_sign);
 
     let jr = JoinRequest {
@@ -79,6 +96,7 @@ async fn main() -> Result<()> {
         sw_hash,
         t_unix_ms: now,
         nonce,
+        ephemeral_pub: eph_pub_bytes, // new field
         sig_gs,
         gs_pub: gs_pk.to_bytes(),
     };
@@ -87,7 +105,8 @@ async fn main() -> Result<()> {
     send_msg(&mut jsend, &jr).await?;
     let ja: JoinAccept = recv_msg(&mut jrecv).await?;
 
-    // Verify VS proved identity over this session_id.
+    // --- 6. Verify VS proved identity over this session_id ---
+    // GS will trust tickets from this VS key going forward.
     let vs_vk = VerifyingKey::from_bytes(&ja.vs_pub).context("bad vs_pub from JoinAccept")?;
     let sig_ok = verify(&vs_vk, &ja.session_id, &ja.sig_vs);
     if !sig_ok {
@@ -100,26 +119,42 @@ async fn main() -> Result<()> {
         ja.sig_vs.len()
     );
 
-    // ---- Background tasks ----
+    // --- 7. Shared state: the most recent blessed PlayTicket from VS ---
+    // We'll demand clients echo this with every input.
+    let latest_ticket: Arc<Mutex<Option<PlayTicket>>> = Arc::new(Mutex::new(None));
+
+    // --- 8. Spawn background tasks ---
+
+    // 8a. Heartbeat loop GS -> VS
+    // IMPORTANT: heartbeats are signed with *ephemeral* key,
+    // not the long-term GS key. VS will verify using ephemeral_pub
+    // we handed over in JoinRequest.
     let hb_counter = Arc::new(AtomicU64::new(0));
     let hb_task = tokio::spawn(heartbeat_loop(
         conn.clone(),
         hb_counter.clone(),
-        gs_sk.clone(),
+        eph_sk.clone(), // <-- ephemeral signer for runtime liveness
         ja.session_id,
     ));
 
-    // ticket_listener enforces signature / monotonic / hash chain.
-    let ticket_task = tokio::spawn(ticket_listener(conn.clone(), ja.session_id, vs_vk));
+    // 8b. Ticket listener VS -> GS
+    // Verifies PlayTickets, enforces continuity, caches newest ticket.
+    let ticket_task = tokio::spawn(ticket_listener(
+        conn.clone(),
+        ja.session_id,
+        vs_vk,
+        latest_ticket.clone(),
+    ));
 
     if opts.test_once {
-        // let a couple heartbeats/tickets flow then exit
+        // let a couple heartbeats/tickets flow, then simulate client input enforcement
         sleep(Duration::from_secs(5)).await;
+        mock_client_input_check(latest_ticket.clone()).await;
         println!("[GS] test_once complete.");
         return Ok(());
     }
 
-    // Stay alive while background tasks run; bail if either dies.
+    // 8c. Stay alive while background tasks run; bail if either dies.
     loop {
         sleep(Duration::from_secs(60)).await;
         if hb_task.is_finished() || ticket_task.is_finished() {
@@ -131,14 +166,16 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+// GS -> VS heartbeat loop.
+// Opens a fresh bi-stream for each heartbeat,
+// signs heartbeat with the *ephemeral* session key.
 async fn heartbeat_loop(
     conn: Connection,
     counter: Arc<AtomicU64>,
-    gs_sk: SigningKey,
+    eph_sk: SigningKey, // now the ephemeral signer
     session_id: [u8; 16],
 ) -> Result<()> {
-    // no receipts yet
-    let receipt_tip = [0u8; 32];
+    let receipt_tip = [0u8; 32]; // placeholder, no receipts yet
 
     loop {
         sleep(Duration::from_secs(2)).await;
@@ -147,7 +184,7 @@ async fn heartbeat_loop(
         let now = now_ms();
 
         let to_sign = heartbeat_sign_bytes(&session_id, c, now, &receipt_tip);
-        let sig_gs = sign(&gs_sk, &to_sign);
+        let sig_gs = sign(&eph_sk, &to_sign); // signed with eph_sk
 
         let hb = Heartbeat {
             session_id,
@@ -175,12 +212,15 @@ async fn heartbeat_loop(
     Ok(())
 }
 
+// VS -> GS ticket listener.
+// Accepts PlayTickets from VS, verifies signature, chain, timing,
+// and records the latest good ticket for use when checking client inputs.
 async fn ticket_listener(
     conn: Connection,
     session_id: [u8; 16],
     vs_pub: VerifyingKey,
+    latest_ticket: Arc<Mutex<Option<PlayTicket>>>,
 ) -> Result<()> {
-    // Track continuity so we can enforce freshness & prevent replay.
     let mut last_counter: u64 = 0;
     let mut last_hash: [u8; 32] = [0u8; 32];
 
@@ -194,7 +234,7 @@ async fn ticket_listener(
                 break;
             }
         };
-        drop(send); // GS doesn't send back on ticket streams.
+        drop(send); // we don't send data on ticket stream
 
         let pt_res = recv_msg::<PlayTicket>(&mut recv).await;
         let pt = match pt_res {
@@ -242,7 +282,7 @@ async fn ticket_listener(
             break;
         }
 
-        // 5. check freshness window
+        // 5. freshness window
         let now = now_ms();
         let ok_time = pt.not_before_ms.saturating_sub(500) <= now
             && now <= pt.not_after_ms.saturating_add(500);
@@ -252,12 +292,55 @@ async fn ticket_listener(
         // 6. update continuity chain for next ticket
         last_counter = pt.counter;
         last_hash = sha256(&body_bytes);
+
+        // 7. publish newest valid ticket so client inputs must echo it
+        {
+            let mut guard = latest_ticket.lock().await;
+            *guard = Some(pt.clone());
+        }
     }
 
     Ok(())
 }
 
-/// Load ed25519 keypair from disk or create new dev keys.
+// Pretend we got input from a client.
+// Before trusting that input, GS would demand the client echo the latest
+// VS-blessed PlayTicket (or its counter + sig_vs).
+//
+// We don't have a client crate yet, so here we just read whatever the
+// latest ticket is and log what we would enforce.
+async fn mock_client_input_check(latest_ticket: Arc<Mutex<Option<PlayTicket>>>) {
+    let snapshot = {
+        let guard = latest_ticket.lock().await;
+        guard.clone()
+    };
+
+    match snapshot {
+        Some(t) => {
+            let now = now_ms();
+            let fresh = t.not_before_ms.saturating_sub(500) <= now
+                && now <= t.not_after_ms.saturating_add(500);
+
+            println!(
+                "[GS] mock client input validation: would accept ticket #{} (fresh={}) for session {}..",
+                t.counter,
+                fresh,
+                hex::encode(&t.session_id[..4]),
+            );
+
+            // Future real check:
+            // - client must include t.counter and t.sig_vs on every input
+            // - reject if !fresh
+        }
+        None => {
+            eprintln!(
+                "[GS] mock client input validation: no ticket yet, would reject client input"
+            );
+        }
+    }
+}
+
+/// Load ed25519 keypair from disk or create new dev keys for the GS long-term identity.
 fn load_or_make_keys(sk_path: &str, pk_path: &str) -> Result<(SigningKey, VerifyingKey)> {
     let skp = PathBuf::from(sk_path);
     let pkp = PathBuf::from(pk_path);
@@ -342,13 +425,13 @@ fn make_client_cfg_insecure() -> Result<ClientConfig> {
 }
 
 /// Create a Quinn client Endpoint bound to an ephemeral UDP port,
-/// choosing IPv4 vs IPv6 family to match the VS address.
+/// matching IPv4/IPv6 family to VS.
 fn make_endpoint_and_addr(vs: &str) -> Result<(Endpoint, SocketAddr)> {
     use quinn::{EndpointConfig, TokioRuntime};
 
     let server_addr: SocketAddr = vs.parse().context("bad vs address")?;
 
-    // Bind locally on same IP family as the server
+    // Bind locally on same IP family as server.
     let bind_ip = match server_addr {
         SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
