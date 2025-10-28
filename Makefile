@@ -5,6 +5,7 @@ clean-lock-build:
 	@echo Cleaning target/ and Cargo.lock...
 	cargo clean
 	-@cmd /C del /F /Q Cargo.lock 2>nul
+	cargo fmt --all
 	cargo build --workspace --all-targets
 
 .PHONY: check

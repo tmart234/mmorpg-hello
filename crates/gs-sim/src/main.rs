@@ -7,10 +7,11 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use common::{
-    crypto::{file_sha256, heartbeat_sign_bytes, join_request_sign_bytes, now_ms, sign},
+    crypto::{file_sha256, heartbeat_sign_bytes, join_request_sign_bytes, now_ms, sign, verify},
     framing::{recv_msg, send_msg},
     proto::{Heartbeat, JoinAccept, JoinRequest, PlayTicket, Sig},
 };
+
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use quinn::{ClientConfig, Connection, Endpoint};
 use rand::{rngs::OsRng, RngCore};
@@ -84,8 +85,17 @@ async fn main() -> Result<()> {
     let (mut jsend, mut jrecv) = conn.open_bi().await?;
     send_msg(&mut jsend, &jr).await?;
     let ja: JoinAccept = recv_msg(&mut jrecv).await?;
+    // Reconstruct VS pubkey from the bytes VS gave us.
+    let vs_pub =
+        VerifyingKey::from_bytes(&ja.vs_pub).context("JoinAccept vs_pub invalid length")?;
+    // VS is supposed to sign just the session_id.
+    let vs_sig_ok = verify(&vs_pub, &ja.session_id, &ja.sig_vs);
+    if !vs_sig_ok {
+        return Err(anyhow!("VS signature on session_id failed"));
+    }
+
     println!(
-        "[GS] joined. session_id={}.. (vs sig {} bytes)",
+        "[GS] joined. session_id={}.. (vs sig OK, len={})",
         hex::encode(&ja.session_id[..4]),
         ja.sig_vs.len()
     );

@@ -80,11 +80,10 @@ struct Opts {
 async fn main() -> Result<()> {
     let opts = Opts::parse();
 
-    // Ensure VS dev keypair exists (writes ./keys if missing).
-    let (vs_sk_raw, _vs_pk) = load_or_make_keys(&opts.vs_sk, &opts.vs_pk)?;
+    let (vs_sk_raw, vs_pk_raw) = load_or_make_keys(&opts.vs_sk, &opts.vs_pk)?;
     let vs_sk = Arc::new(vs_sk_raw);
+    let vs_pk = Arc::new(vs_pk_raw);
 
-    // Shared session map
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
 
     // Spin up QUIC listener with a self-signed cert
@@ -100,9 +99,12 @@ async fn main() -> Result<()> {
         };
 
         let vs_sk_clone = vs_sk.clone();
+        let vs_pk_clone = vs_pk.clone();
         let sessions_clone = sessions.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(connecting, vs_sk_clone, sessions_clone).await {
+            if let Err(e) =
+                handle_connection(connecting, vs_sk_clone, vs_pk_clone, sessions_clone).await
+            {
                 eprintln!("[VS] conn error: {e:?}");
             }
         });
@@ -118,6 +120,7 @@ async fn main() -> Result<()> {
 async fn handle_connection(
     connecting: quinn::Connecting,
     vs_sk: Arc<SigningKey>,
+    vs_pk: Arc<VerifyingKey>,
     sessions: Sessions,
 ) -> Result<()> {
     // Finish QUIC handshake -> live Connection
@@ -166,7 +169,11 @@ async fn handle_connection(
 
     let sig_vs: Sig = sign(vs_sk.as_ref(), &session_id);
 
-    let ja = JoinAccept { session_id, sig_vs };
+    let ja = JoinAccept {
+        session_id,
+        sig_vs,
+        vs_pub: vs_pk.to_bytes(),
+    };
 
     // Send JoinAccept back on same stream.
     send_msg(&mut vs_send, &ja)
