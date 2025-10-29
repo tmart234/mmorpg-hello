@@ -15,7 +15,7 @@ Flow:
 5. GS rejects input if the proof isn’t current / signed / fresh.
 6. VS can revoke a GS at runtime; that revocation ripples to all players in ~seconds via ticket starvation + connection close.
 
-This is basically anti-cheat + anti-rogue-host + audit trail, built into the protocol.
+Goal: anti-cheat + anti-rogue-host + audit trail, built into the protocol.
 
 ---
 
