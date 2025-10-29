@@ -1,6 +1,6 @@
 # mmo
 
-A fast and security-first MMO framework with decentralized hosting.
+How can cryptography can keep both the player and the world around them in check?
 
 ## High-level idea
 
