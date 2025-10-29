@@ -160,7 +160,12 @@ async fn handle_connection(incoming: quinn::Incoming, vs_sk: Arc<SigningKey>) ->
         &jr.nonce,
         &jr.ephemeral_pub,
     );
-    if !verify(&gs_identity_vk, &join_bytes, &jr.sig_gs) {
+    let sig_gs_arr: [u8; 64] = jr
+        .sig_gs
+        .clone()
+        .try_into()
+        .map_err(|_| anyhow!("JoinRequest sig_gs len != 64"))?;
+    if !verify(&gs_identity_vk, &join_bytes, &sig_gs_arr) {
         bail!("JoinRequest sig_gs invalid");
     }
 
@@ -192,7 +197,8 @@ async fn handle_connection(incoming: quinn::Incoming, vs_sk: Arc<SigningKey>) ->
     }));
 
     // ===== reply JoinAccept =====
-    let sig_vs: Sig = sign(vs_sk.as_ref(), &session_id);
+    let sig_vs: Sig = sign(vs_sk.as_ref(), &session_id).to_vec();
+
     let ja = JoinAccept {
         session_id,
         sig_vs,
@@ -236,7 +242,7 @@ async fn handle_connection(incoming: quinn::Incoming, vs_sk: Arc<SigningKey>) ->
                     }
                 };
 
-                let sig_vs: Sig = sign(vs_sk.as_ref(), &body_bytes);
+                let sig_vs_arr: [u8; 64] = sign(vs_sk.as_ref(), &body_bytes);
 
                 let pt = PlayTicket {
                     session_id,
@@ -245,7 +251,7 @@ async fn handle_connection(incoming: quinn::Incoming, vs_sk: Arc<SigningKey>) ->
                     not_before_ms: not_before,
                     not_after_ms: not_after,
                     prev_ticket_hash: prev_hash,
-                    sig_vs,
+                    sig_vs: sig_vs_arr,
                 };
 
                 // update hash chain for next ticket
@@ -318,7 +324,7 @@ async fn handle_connection(incoming: quinn::Incoming, vs_sk: Arc<SigningKey>) ->
                             }
                         };
 
-                    let sig_vs: Sig = sign(vs_sk.as_ref(), &pr_body);
+                    let sig_vs: Sig = sign(vs_sk.as_ref(), &pr_body).to_vec();
 
                     let pr = ProtectedReceipt {
                         session_id: td.session_id,
@@ -340,6 +346,7 @@ async fn handle_connection(incoming: quinn::Incoming, vs_sk: Arc<SigningKey>) ->
                     continue;
                 }
 
+                // Otherwise try Heartbeat.
                 // Otherwise try Heartbeat.
                 if let Ok(hb) = bincode::deserialize::<Heartbeat>(&buf) {
                     // Lock state so we can check monotonic counter and liveness.
@@ -375,7 +382,24 @@ async fn handle_connection(incoming: quinn::Incoming, vs_sk: Arc<SigningKey>) ->
                         hb.gs_time_ms,
                         &hb.receipt_tip,
                     );
-                    if !verify(&eph_vk, &hb_bytes, &hb.sig_gs) {
+
+                    // OLD (bad in a `tokio::spawn` task because of `?`)
+                    // let hb_sig_arr: [u8; 64] = hb
+                    //     .sig_gs
+                    //     .clone()
+                    //     .try_into()
+                    //     .map_err(|_| anyhow!("Heartbeat sig_gs len != 64"))?;
+
+                    // NEW (no `?`, we just handle it inline)
+                    let hb_sig_arr: [u8; 64] = match hb.sig_gs.clone().try_into() {
+                        Ok(arr) => arr,
+                        Err(_) => {
+                            eprintln!("[VS] heartbeat sig_gs wrong length (expected 64)");
+                            continue;
+                        }
+                    };
+
+                    if !verify(&eph_vk, &hb_bytes, &hb_sig_arr) {
                         eprintln!("[VS] heartbeat sig BAD");
                         continue;
                     }

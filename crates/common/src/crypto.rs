@@ -1,3 +1,4 @@
+use crate::proto::Sig;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256 as Sha2};
@@ -77,4 +78,50 @@ pub fn rolling_hash_update(prev: [u8; 32], event_bytes: &[u8]) -> [u8; 32] {
     h.update(prev);
     h.update(event_bytes);
     h.finalize().into()
+}
+
+/// Turn a runtime signature Vec<u8> (should be 64 bytes)
+/// into a fixed [u8; 64]. Returns None if it's the wrong length.
+pub fn sigvec_to_array64(sig: &Sig) -> Option<[u8; 64]> {
+    if sig.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 64];
+    out.copy_from_slice(sig);
+    Some(out)
+}
+
+/// Canonical bytes the client signs for ClientInput.
+/// MUST match on both client and GS.
+pub fn client_input_sign_bytes(
+    session_id: &[u8; 16],
+    ticket_counter: u64,
+    ticket_sig_vs: &[u8; 64],
+    client_nonce: u64,
+    cmd: &crate::proto::ClientCmd,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + 8 + 64 + 8 + 1 + 8);
+
+    // session_id
+    out.extend_from_slice(session_id);
+
+    // ticket_counter
+    out.extend_from_slice(&ticket_counter.to_le_bytes());
+
+    // VS signature stapled to this input
+    out.extend_from_slice(ticket_sig_vs);
+
+    // client_nonce
+    out.extend_from_slice(&client_nonce.to_le_bytes());
+
+    // command tag + payload
+    match cmd {
+        crate::proto::ClientCmd::Move { dx, dy } => {
+            out.push(0u8); // variant tag for Move
+            out.extend_from_slice(&dx.to_le_bytes());
+            out.extend_from_slice(&dy.to_le_bytes());
+        }
+    }
+
+    out
 }

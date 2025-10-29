@@ -3,7 +3,7 @@ use clap::Parser;
 use common::{
     crypto::{file_sha256, join_request_sign_bytes, now_ms, sign, verify},
     framing::{recv_msg, send_msg},
-    proto::{JoinAccept, JoinRequest, Sig},
+    proto::{JoinAccept, JoinRequest, PlayTicket, Sig},
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use quinn::{Connection, Endpoint};
@@ -51,8 +51,7 @@ struct Opts {
 async fn main() -> Result<()> {
     let opts = Opts::parse();
 
-    // rustls 0.23+: pick a crypto backend (ring) for this process.
-    // If we don't do this, rustls panics at runtime ("Could not automatically determine the process-level CryptoProvider").
+    // rustls 0.23+ needs a global CryptoProvider (ring or aws-lc-rs).
     {
         use rustls::crypto::{ring, CryptoProvider};
         CryptoProvider::install_default(ring::default_provider())
@@ -65,7 +64,7 @@ async fn main() -> Result<()> {
     let (gs_sk_long, gs_pk_long) = load_or_make_keys(&opts.gs_sk, &opts.gs_pk)?;
 
     //
-    // 2. Create per-session ephemeral signing key.
+    // 2. Create per-session ephemeral signing key (this run).
     //
     let eph_sk = SigningKey::generate(&mut OsRng);
     let eph_pub_bytes = eph_sk.verifying_key().to_bytes();
@@ -93,7 +92,7 @@ async fn main() -> Result<()> {
 
     let now = now_ms();
     let to_sign = join_request_sign_bytes(&opts.gs_id, &sw_hash, now, &nonce, &eph_pub_bytes);
-    let sig_gs: Sig = sign(&gs_sk_long, &to_sign);
+    let sig_gs: Sig = sign(&gs_sk_long, &to_sign).to_vec(); // [u8;64] -> Vec<u8>
 
     let jr = JoinRequest {
         gs_id: opts.gs_id.clone(),
@@ -114,7 +113,14 @@ async fn main() -> Result<()> {
     //
     let vs_vk = VerifyingKey::from_bytes(&ja.vs_pub).context("bad vs_pub from JoinAccept")?;
 
-    let sig_ok = verify(&vs_vk, &ja.session_id, &ja.sig_vs);
+    // ja.sig_vs is Vec<u8>, but verify() wants &[u8; 64]
+    let sig_vs_arr: [u8; 64] = ja
+        .sig_vs
+        .clone()
+        .try_into()
+        .map_err(|_| anyhow!("VS sig length != 64"))?;
+
+    let sig_ok = verify(&vs_vk, &ja.session_id, &sig_vs_arr);
     if !sig_ok {
         bail!("VS signature invalid on JoinAccept");
     }
@@ -126,14 +132,17 @@ async fn main() -> Result<()> {
     );
 
     //
-    // 7. Shared GS state (session, latest ticket, receipt_tip, revoked flag...)
+    // 7. Shared GS state (session, latest ticket, receipt_tip, revoked flag...).
     //
     let shared: Shared = Arc::new(Mutex::new(GsSharedState::new(ja.session_id, ja.vs_pub)));
 
     //
-    // 8. Channel to broadcast "revoked" to all client handlers.
+    // 8. Channels:
+    //    - revoke_tx / revoke_rx: broadcast "VS revoked this GS"
+    //    - ticket_tx / ticket_rx: broadcast latest PlayTicket
     //
     let (revoke_tx, revoke_rx) = watch::channel(false);
+    let (ticket_tx, ticket_rx) = watch::channel::<Option<PlayTicket>>(None);
 
     //
     // 9. Spawn runtime tasks: heartbeat, ticket listener, client TCP port.
@@ -143,21 +152,29 @@ async fn main() -> Result<()> {
     let heartbeat_task = tokio::spawn(heartbeat_loop(
         conn.clone(),
         hb_counter.clone(),
-        eph_sk.clone(),
+        eph_sk, // move
         ja.session_id,
         shared.clone(),
     ));
 
-    // b) ticket_listener: VS → GS PlayTickets stream + revocation watchdog
+    // b) ticket_listener:
+    //    VS → GS PlayTickets stream + revocation watchdog
     let tickets_task = tokio::spawn(ticket_listener(
         conn.clone(),
         shared.clone(),
         vs_vk,
         revoke_tx.clone(),
+        ticket_tx.clone(),
     ));
 
-    // c) client_port_task: TCP listener accepting local client-sim connections
-    let client_port_task_handle = tokio::spawn(client_port_task(shared.clone(), revoke_rx.clone()));
+    // c) client_port_task:
+    //    TCP listener accepting local client-sim connections.
+    //    Each client waits for first ticket via ticket_rx before we send ServerHello.
+    let client_port_task_handle = tokio::spawn(client_port_task(
+        shared.clone(),
+        revoke_rx.clone(),
+        ticket_rx.clone(),
+    ));
 
     //
     // 10. --test_once mode: let smoke test run a bit, then exit.
@@ -237,7 +254,7 @@ fn make_client_cfg_insecure() -> Result<quinn::ClientConfig> {
         DigitallySignedStruct, SignatureScheme,
     };
 
-    // Our "trust anything" verifier. This is ONLY for local dev.
+    // Our "trust anything" verifier. ONLY for local dev.
     #[derive(Debug)]
     struct NoVerify;
 
@@ -272,7 +289,6 @@ fn make_client_cfg_insecure() -> Result<quinn::ClientConfig> {
         }
 
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            // This can just advertise common schemes. We're not actually verifying.
             vec![
                 SignatureScheme::ECDSA_NISTP256_SHA256,
                 SignatureScheme::ED25519,
@@ -287,7 +303,7 @@ fn make_client_cfg_insecure() -> Result<quinn::ClientConfig> {
         .with_custom_certificate_verifier(Arc::new(NoVerify))
         .with_no_client_auth();
 
-    // Quinn 0.11 wants a quinn::crypto::ClientConfig (trait object),
+    // Quinn 0.11 wants a quinn::crypto::ClientConfig (trait obj),
     // not raw rustls::ClientConfig. We wrap it.
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls_cfg))
         .map_err(|e| anyhow!("QuicClientConfig::try_from: {e:?}"))?;
