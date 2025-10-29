@@ -1,7 +1,5 @@
 # mmo
 
-How can cryptography can keep both the player and the world around them in check?
-
 ## High-level idea
 
 We split authority into two roles:
