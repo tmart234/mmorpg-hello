@@ -6,9 +6,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-test:
+  build-test-and-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+
     steps:
       - uses: actions/checkout@v4
 
@@ -27,7 +28,7 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-
 
-      - name: Run CI-lite (fmt, clippy, build, tests, smoke)
+      - name: Run CI-lite (fmt, clippy, build, test, smoke)
         run: make ci
 
       - name: Security audit
