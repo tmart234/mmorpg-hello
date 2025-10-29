@@ -12,6 +12,7 @@ pub struct PlayerState {
 }
 
 /// Global mutable GS session state shared across tasks.
+///
 /// Wrapped as `Shared = Arc<Mutex<GsSharedState>>`.
 pub struct GsSharedState {
     /// Session ID assigned by VS in JoinAccept.
@@ -21,15 +22,20 @@ pub struct GsSharedState {
     /// can verify PlayTicket signatures and pin VS identity.
     pub vs_pub: [u8; 32],
 
+    /// sw_hash of the running GS binary for this session.
+    /// We assert this in JoinRequest AND in every Heartbeat to prevent
+    /// "start clean, then hotpatch cheats mid-session".
+    pub sw_hash: [u8; 32],
+
     /// Latest VS-issued PlayTicket we've accepted.
     /// ticket_listener() keeps this fresh.
     pub latest_ticket: Option<PlayTicket>,
 
-    /// When (ms since epoch) we last got a fresh ticket.
+    /// ms-since-epoch when we last got a fresh ticket from VS.
     /// Used by the watchdog to detect VS silence and mark us revoked.
     pub last_ticket_ms: u64,
 
-    /// Rolling hash of accepted inputs + authoritative GS outcomes.
+    /// Rolling hash of accepted inputs + authoritative GS outcomes ("transcript tip").
     /// heartbeat_loop sends this to VS so VS can notarize what we claim happened.
     pub receipt_tip: [u8; 32],
 
@@ -44,10 +50,11 @@ pub struct GsSharedState {
 }
 
 impl GsSharedState {
-    pub fn new(session_id: [u8; 16], vs_pub: [u8; 32]) -> Self {
+    pub fn new(session_id: [u8; 16], vs_pub: [u8; 32], sw_hash: [u8; 32]) -> Self {
         Self {
             session_id,
             vs_pub,
+            sw_hash,
             latest_ticket: None,
             last_ticket_ms: 0,
             receipt_tip: [0u8; 32],

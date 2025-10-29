@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
     let eph_pub_bytes = eph_sk.verifying_key().to_bytes();
 
     //
-    // 3. Compute sw_hash of our running binary (attestation placeholder).
+    // 3. Compute sw_hash of our running binary (attestation of code identity).
     //
     let exe = std::env::current_exe()?;
     let sw_hash = file_sha256(&exe)?;
@@ -132,9 +132,13 @@ async fn main() -> Result<()> {
     );
 
     //
-    // 7. Shared GS state (session, latest ticket, receipt_tip, revoked flag...).
+    // 7. Shared GS state (session, sw_hash, latest ticket, receipt_tip, revoked flag...).
     //
-    let shared: Shared = Arc::new(Mutex::new(GsSharedState::new(ja.session_id, ja.vs_pub)));
+    let shared: Shared = Arc::new(Mutex::new(GsSharedState::new(
+        ja.session_id,
+        ja.vs_pub,
+        sw_hash,
+    )));
 
     //
     // 8. Channels:
@@ -147,12 +151,12 @@ async fn main() -> Result<()> {
     //
     // 9. Spawn runtime tasks: heartbeat, ticket listener, client TCP port.
     //
-    // a) heartbeat_loop: GS → VS liveness + receipt_tip every ~2s
+    // a) heartbeat_loop: GS → VS liveness + receipt_tip + sw_hash re-attestation
     let hb_counter = Arc::new(AtomicU64::new(0));
     let heartbeat_task = tokio::spawn(heartbeat_loop(
         conn.clone(),
         hb_counter.clone(),
-        eph_sk, // move
+        eph_sk, // move ephemeral GS session signing key
         ja.session_id,
         shared.clone(),
     ));

@@ -64,13 +64,22 @@ pub fn join_request_sign_bytes(
     bincode::serialize(&(gs_id, sw_hash, t_unix_ms, nonce, ephemeral_pub)).unwrap()
 }
 
+/// Canonical bytes the GS signs for each Heartbeat.
+/// We now also include `sw_hash` to prove we are still running the same binary.
+///
+/// (session_id,
+///  gs_counter,
+///  gs_time_ms,
+///  receipt_tip,
+///  sw_hash)
 pub fn heartbeat_sign_bytes(
     session_id: &[u8; 16],
     gs_counter: u64,
     gs_time_ms: u64,
     receipt_tip: &[u8; 32],
+    sw_hash: &[u8; 32],
 ) -> Vec<u8> {
-    bincode::serialize(&(session_id, gs_counter, gs_time_ms, receipt_tip)).unwrap()
+    bincode::serialize(&(session_id, gs_counter, gs_time_ms, receipt_tip, sw_hash)).unwrap()
 }
 
 pub fn rolling_hash_update(prev: [u8; 32], event_bytes: &[u8]) -> [u8; 32] {

@@ -15,10 +15,30 @@ use tokio::time::sleep;
 
 use crate::state::Shared;
 
-/// Periodic GS → VS liveness + transcript attestation.
-/// - Sends a Heartbeat proving "I'm alive, here's my counter/time/tip"
-/// - Sends a TranscriptDigest proving "this is the sim transcript tip I'm claiming"
-///   and expects a ProtectedReceipt (VS-signed acknowledgment).
+/// Periodic GS → VS liveness + transcript attestation + runtime attestation.
+///
+/// We send:
+///   Heartbeat {
+///       session_id,
+///       gs_counter,
+///       gs_time_ms,
+///       receipt_tip,
+///       sw_hash,    // prove we didn't hotpatch
+///       sig_gs,
+///   }
+///
+/// Then we also send:
+///   TranscriptDigest {
+///       session_id,
+///       gs_counter,
+///       receipt_tip,
+///       positions: Vec<(client_pub, x, y)>,
+///   }
+///
+/// VS can:
+///  - kill us if sw_hash doesn't match approved code
+///  - kill us if movement looks physically impossible
+///  - sign back a ProtectedReceipt so we can't deny our transcript later
 pub async fn heartbeat_loop(
     conn: Connection,
     counter: Arc<AtomicU64>,
@@ -34,8 +54,8 @@ pub async fn heartbeat_loop(
         let c = counter.fetch_add(1, Ordering::SeqCst) + 1;
         let now = now_ms();
 
-        // Snapshot the rolling "receipt_tip" hash that summarizes GS transcript so far
-        let receipt_tip_now = {
+        // Snapshot GS shared state (no await while holding lock)
+        let (receipt_tip_now, sw_hash_now, positions_vec) = {
             let guard = match shared.lock() {
                 Ok(g) => g,
                 Err(poison) => {
@@ -45,23 +65,30 @@ pub async fn heartbeat_loop(
                     poison.into_inner()
                 }
             };
-            guard.receipt_tip
+
+            // Snapshot of all player positions for VS invariant checks
+            let mut pos_out = Vec::with_capacity(guard.players.len());
+            for (pubkey, ps) in guard.players.iter() {
+                pos_out.push((*pubkey, ps.x, ps.y));
+            }
+
+            (guard.receipt_tip, guard.sw_hash, pos_out)
         };
 
         // Canonical bytes we sign for Heartbeat:
-        // (session_id, gs_counter, gs_time_ms, receipt_tip)
-        let to_sign = heartbeat_sign_bytes(&session_id, c, now, &receipt_tip_now);
+        // (session_id, gs_counter, gs_time_ms, receipt_tip, sw_hash)
+        let to_sign = heartbeat_sign_bytes(&session_id, c, now, &receipt_tip_now, &sw_hash_now);
 
-        // Per-session ephemeral key signs this heartbeat (NOT the long-term GS key!)
+        // Per-session ephemeral key signs this heartbeat
         let sig_gs_bytes = sign(&eph_sk, &to_sign); // [u8; 64]
 
         // Build the Heartbeat message we'll send to VS.
-        // Heartbeat.sig_gs is Vec<u8>, so convert.
         let hb = Heartbeat {
             session_id,
             gs_counter: c,
             gs_time_ms: now,
             receipt_tip: receipt_tip_now,
+            sw_hash: sw_hash_now,
             sig_gs: sig_gs_bytes.to_vec(),
         };
 
@@ -85,11 +112,12 @@ pub async fn heartbeat_loop(
         let pair2 = conn.open_bi().await;
         match pair2 {
             Ok((mut send2, mut recv2)) => {
-                // What GS claims its authoritative transcript tip is at counter c
+                // What GS claims its authoritative transcript tip and positions are
                 let td = TranscriptDigest {
                     session_id,
                     gs_counter: c,
                     receipt_tip: receipt_tip_now,
+                    positions: positions_vec,
                 };
 
                 if let Err(e) = send_msg(&mut send2, &td).await {

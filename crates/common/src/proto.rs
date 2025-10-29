@@ -11,7 +11,7 @@ pub type Sig = Vec<u8>;
 pub struct JoinRequest {
     pub gs_id: String,
 
-    /// Hash of the GS binary (attestation placeholder for now).
+    /// Hash of the GS binary (attestation / build identity).
     pub sw_hash: [u8; 32],
 
     /// Wallclock time (ms since Unix epoch) when this was signed.
@@ -85,7 +85,8 @@ pub enum ClientCmd {
     Move { dx: f32, dy: f32 },
 }
 
-/// Client → GS input packet (one per "frame"/tick").
+/// Client → GS input packet (one per "frame"/tick).
+/// The client staples a recent VS-signed PlayTicket and signs the whole thing.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ClientInput {
     /// Which GS session this input is for.
@@ -105,20 +106,21 @@ pub struct ClientInput {
     /// The actual command (Move, etc.).
     pub cmd: ClientCmd,
 
-    /// Client pubkey (Ed25519, 32 bytes) representing this player.
+    /// Ephemeral/peristent client pubkey (Ed25519, 32 bytes) for this player.
     pub client_pub: [u8; 32],
 
     /// Client signature (Ed25519, 64 bytes) over canonical tuple:
-    /// (session_id, ticket_counter, ticket_sig_vs, client_nonce, cmd)
+    /// (session_id,
+    ///  ticket_counter,
+    ///  ticket_sig_vs,
+    ///  client_nonce,
+    ///  cmd)
     #[serde(with = "BigArray")]
     pub client_sig: [u8; 64],
 }
 
 /// GS authoritative events that matter for transcript / audit / replay.
-///
-/// Each tick GS turns ClientInput into actual sim state ("here is where you
-/// ended up", "who hit who for how much", etc.). We hash these events into
-/// `receipt_tip` so GS can't rewrite history later.
+/// We hash these into receipt_tip so GS can't rewrite history later.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum AuthoritativeEvent {
     MoveResolved {
@@ -132,6 +134,7 @@ pub enum AuthoritativeEvent {
 /// GS → client: snapshot of world state for rendering / HUD / etc.
 ///
 /// This is what the future Vulkan/wgpu client will consume.
+/// We no longer send session_id here; the client already knows which session it's in.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WorldSnapshot {
     pub tick: u64,
@@ -152,7 +155,6 @@ pub enum ClientToGs {
 }
 
 /// Messages flowing GS -> Client over the local TCP link.
-/// We mostly send raw structs today, but this enum is here for evolution.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum GsToClient {
     ServerHello(ServerHello),
@@ -165,7 +167,7 @@ pub enum GsToClient {
 // -------------------------
 
 /// GS → VS heartbeat (~2s).
-/// Proves liveness and pushes the GS's current transcript tip.
+/// Proves liveness and re-attests code identity and transcript tip.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Heartbeat {
     pub session_id: [u8; 16],
@@ -176,23 +178,31 @@ pub struct Heartbeat {
     /// GS local time in ms (used for debug / replay forensics).
     pub gs_time_ms: u64,
 
-    /// Rolling hash / commitment of all "accepted" events so far.
+    /// Rolling hash / commitment of accepted client inputs + authoritative GS outcomes.
     pub receipt_tip: [u8; 32],
+
+    /// sw_hash of the GS binary this tick.
+    /// VS compares this to the allowlist and to the hash from JoinRequest.
+    pub sw_hash: [u8; 32],
 
     /// Signature by GS's ephemeral session key over the canonical heartbeat bytes.
     pub sig_gs: Sig,
 }
 
 /// GS → VS: "Here's my current transcript digest at counter C."
+/// VS can sanity-check movement and physics using these positions.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TranscriptDigest {
     pub session_id: [u8; 16],
     pub gs_counter: u64,
     pub receipt_tip: [u8; 32],
+
+    /// Player positions as GS claims them *right now*.
+    /// Vec of (player_pubkey, x, y).
+    pub positions: Vec<([u8; 32], f32, f32)>,
 }
 
-/// VS → GS in response to TranscriptDigest.
-/// VS signs what GS claimed so GS can't deny it later.
+/// VS → GS. VS signs what GS claimed, so GS can't deny it later.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ProtectedReceipt {
     pub session_id: [u8; 16],

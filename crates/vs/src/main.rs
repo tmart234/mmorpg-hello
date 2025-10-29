@@ -381,6 +381,7 @@ async fn handle_connection(incoming: quinn::Incoming, vs_sk: Arc<SigningKey>) ->
                         hb.gs_counter,
                         hb.gs_time_ms,
                         &hb.receipt_tip,
+                        &hb.sw_hash,
                     );
 
                     // OLD (bad in a `tokio::spawn` task because of `?`)
