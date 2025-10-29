@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use common::{
     crypto::{client_input_sign_bytes, now_ms, sha256},
-    proto::{ClientCmd, ClientToGs, PlayTicket, ServerHello, WorldSnapshot},
+    proto::{AuthoritativeEvent, ClientCmd, ClientToGs, PlayTicket, ServerHello, WorldSnapshot},
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use std::{convert::TryFrom, net::SocketAddr};
@@ -38,43 +38,43 @@ async fn recv_bin_tcp<T: serde::de::DeserializeOwned>(sock: &mut TcpStream) -> R
     Ok(msg)
 }
 
-/// Local TCP listener that talks to a client instance (client-sim for now).
+/// This task runs a TCP listener that speaks to local clients (client-sim / future real client).
 ///
-/// Responsibilities per client connection:
-///  - wait until we actually have a current PlayTicket from VS
-///  - send `ServerHello { session_id, ticket, vs_pub }`
-///  - then in a loop:
-///      * check for revocation via `revoke_rx`
-///      * recv `ClientToGs::Input`
-///      * verify ticket freshness / counter match
-///      * enforce ticket.client_binding matches the sender pubkey
-///      * enforce per-client monotonic nonce
-///      * verify client's signature
-///      * clamp movement
-///      * update receipt_tip (transcript hash)
-///      * reply with multi-entity `WorldSnapshot`
+/// Per accepted client socket we:
+///   - wait for first PlayTicket from VS
+///   - send ServerHello { session_id, ticket, vs_pub }
+///   - loop:
+///       * check revoke_rx
+///       * recv signed ClientInput
+///       * validate ticket freshness, binding, nonce monotonicity
+///       * verify client's ed25519 signature
+///       * clamp movement and update shared world state
+///       * update rolling receipt_tip with BOTH the ClientInput and
+///         the authoritative outcome event
+///       * send WorldSnapshot { tick, you, others }
 ///
-/// Trust model:
-///  - GS trusts VS (PlayTicket, vs_pub)
-///  - GS trusts only inputs that are (a) signed by that client key, (b) bound to a fresh ticket,
-///    (c) monotonic nonce, (d) not revoked.
+/// Security-wise:
+///   - ticket.client_binding ties a ticket to one pubkey
+///   - per-player nonce stops replay
+///   - clamp stops client-side teleport
+///   - receipt_tip commits GS to the "authoritative truth" of what just happened
 pub async fn client_port_task(
     shared: Shared,
     revoke_rx: watch::Receiver<bool>,
     ticket_rx: watch::Receiver<Option<PlayTicket>>,
 ) -> Result<()> {
-    // Bind a local port for clients to connect (client-sim, future real client).
+    // Bind a local port for clients to connect.
     let listener = TcpListener::bind("127.0.0.1:50000")
         .await
         .context("bind 127.0.0.1:50000")?;
 
-    // Outer accept loop: one spawned task per client connection.
+    // Accept loop: one spawned task per client connection.
     'accept_loop: loop {
         let (mut socket, peer_addr): (TcpStream, SocketAddr) =
             listener.accept().await.context("accept client")?;
         println!("[GS] client connected from {}", peer_addr);
 
-        // If we've already been revoked, just refuse immediately.
+        // If we've already been revoked, refuse immediately.
         if *revoke_rx.borrow() {
             eprintln!(
                 "[GS] refusing client {}: session already revoked",
@@ -83,27 +83,25 @@ pub async fn client_port_task(
             continue 'accept_loop;
         }
 
-        // Snapshot session_id and vs_pub exactly once for this client.
+        // Snapshot session_id and vs_pub once for this client.
         let (session_id, vs_pub) = {
             let guard = shared.lock().unwrap();
             (guard.session_id, guard.vs_pub)
         };
 
-        // Clone a local watch receiver for tickets so this client follows updates.
-        // We will *wait* until we have a Some(PlayTicket) before proceeding.
+        // Wait for first PlayTicket from VS.
         let mut local_ticket_rx = ticket_rx.clone();
         let first_ticket: PlayTicket = loop {
             if let Some(t) = local_ticket_rx.borrow().clone() {
                 break t;
             }
-            // wait for VS to send the first PlayTicket via ticket_listener()
             if local_ticket_rx.changed().await.is_err() {
                 eprintln!("[GS] ticket_rx closed; shutting client_port_task listener");
                 return Ok(());
             }
         };
 
-        // Send initial ServerHello with the first ticket.
+        // Send initial ServerHello.
         let hello = ServerHello {
             session_id,
             ticket: first_ticket.clone(),
@@ -115,24 +113,25 @@ pub async fn client_port_task(
             continue 'accept_loop;
         }
 
-        // Each client gets its own async task so we can go back to accept().
+        // Spawn per-client connection task.
         let shared_cloned = shared.clone();
         let revoke_rx_client = revoke_rx.clone();
-        let client_ticket_rx = local_ticket_rx; // moved into task
+        let client_ticket_rx = local_ticket_rx; // moved in
         let session_id_for_client = session_id;
 
         tokio::spawn(async move {
+            // local view of "world tick" for snapshots
             let mut tick: u64 = 0;
             let mut socket = socket;
 
             loop {
-                // Hard revoke? Kill client immediately.
+                // Instant revoke? Disconnect them.
                 if *revoke_rx_client.borrow() {
                     eprintln!("[GS] closing client {} (revoked)", peer_addr);
                     break;
                 }
 
-                // Receive exactly one client message.
+                // Receive one client message.
                 let msg_res = recv_bin_tcp::<ClientToGs>(&mut socket).await;
                 let ci = match msg_res {
                     Ok(ClientToGs::Input(ci)) => ci,
@@ -142,8 +141,7 @@ pub async fn client_port_task(
                     }
                 };
 
-                // Grab the freshest VS ticket we have from VS.
-                // (ticket_listener keeps this updated via watch channel.)
+                // Get latest PlayTicket from VS.
                 let cur_ticket = match client_ticket_rx.borrow().clone() {
                     Some(t) => t,
                     None => {
@@ -154,31 +152,24 @@ pub async fn client_port_task(
 
                 let now_ms_val = now_ms();
 
-                // -----------------------------------------------------------------
-                // Do all validation, sim update, transcript update, and snapshot
-                // BUILD inside a no-await block that holds the mutex.
+                // Do validation, world update, transcript update, and snapshot
+                // atomically inside the mutex with NO await.
                 //
-                // Return:
-                //   Ok(snapshot) -> we send it to the client this tick
-                //   Err(())      -> we drop the client
-                // -----------------------------------------------------------------
+                // Returns Ok(snapshot) to send, or Err(()) to drop client.
                 let step_res: Result<WorldSnapshot, ()> = (|| {
-                    // Lock global GS state
+                    // Lock shared GS state
                     let mut guard = shared_cloned.lock().unwrap();
 
-                    // --- Phase 0: read current per-player state immutably ---
-                    // We don't mutate yet, we just copy out for checks.
+                    // Phase 0: read current per-player state.
                     let (prev_x, prev_y, prev_nonce) = match guard.players.get(&ci.client_pub) {
                         Some(ps) => (ps.x, ps.y, ps.last_nonce),
                         None => (0.0, 0.0, 0),
                     };
                     let prev_tip = guard.receipt_tip;
 
-                    // --------------------------
-                    // Validation / auth checks
-                    // --------------------------
+                    // ---- Validation / trust checks ----
 
-                    // 1) ticket counter must match input's claimed counter
+                    // Ticket counter must match.
                     if ci.ticket_counter != cur_ticket.counter {
                         eprintln!(
                             "[GS] bad ticket_counter from {peer_addr} (got {}, expected {})",
@@ -187,20 +178,20 @@ pub async fn client_port_task(
                         return Err(());
                     }
 
-                    // 2) ticket_sig_vs from client must match the VS-signed ticket
+                    // ticket_sig_vs must match VS signature from current ticket.
                     if ci.ticket_sig_vs != cur_ticket.sig_vs {
                         eprintln!("[GS] ticket_sig_vs mismatch from {peer_addr}");
                         return Err(());
                     }
 
-                    // 3) ticket must be fresh: within not_before_ms .. not_after_ms
+                    // Ticket must be fresh.
                     if now_ms_val < cur_ticket.not_before_ms || now_ms_val > cur_ticket.not_after_ms
                     {
                         eprintln!("[GS] stale/expired ticket from {peer_addr}");
                         return Err(());
                     }
 
-                    // 4) session_id binding check
+                    // session_id binding check.
                     if ci.session_id != session_id_for_client
                         || cur_ticket.session_id != session_id_for_client
                     {
@@ -208,8 +199,8 @@ pub async fn client_port_task(
                         return Err(());
                     }
 
-                    // 5) enforce ticket.client_binding
-                    //    [0u8;32] means "unbound / any client is OK".
+                    // client_binding enforcement:
+                    // if VS said "this ticket is for pubkey X", then only X may act.
                     if cur_ticket.client_binding != [0u8; 32]
                         && cur_ticket.client_binding != ci.client_pub
                     {
@@ -220,8 +211,7 @@ pub async fn client_port_task(
                         return Err(());
                     }
 
-                    // 6) anti-replay / ordering via monotonically increasing client_nonce,
-                    //    but now PER CLIENT, not global.
+                    // per-client anti-replay via nonce monotonicity
                     if ci.client_nonce <= prev_nonce {
                         eprintln!(
                             "[GS] client_nonce non-monotonic from {peer_addr} (got {}, last {})",
@@ -230,8 +220,7 @@ pub async fn client_port_task(
                         return Err(());
                     }
 
-                    // 7) verify client's signature over canonical tuple
-                    //    sign_bytes = bincode( (session_id, ticket_counter, ticket_sig_vs, client_nonce, cmd) )
+                    // Verify client's signature over canonical tuple.
                     let sign_bytes = client_input_sign_bytes(
                         &ci.session_id,
                         ci.ticket_counter,
@@ -240,7 +229,6 @@ pub async fn client_port_task(
                         &ci.cmd,
                     );
 
-                    // Parse claimed client_pub
                     let client_vk = match VerifyingKey::from_bytes(&ci.client_pub) {
                         Ok(vk) => vk,
                         Err(e) => {
@@ -249,7 +237,6 @@ pub async fn client_port_task(
                         }
                     };
 
-                    // Convert raw [u8;64] sig bytes to dalek Signature
                     let sig = match Signature::try_from(&ci.client_sig[..]) {
                         Ok(s) => s,
                         Err(_) => {
@@ -263,12 +250,11 @@ pub async fn client_port_task(
                         return Err(());
                     }
 
-                    // --------------------------
-                    // Simulation step
-                    // --------------------------
+                    // ---- Simulation step ----
+                    // clamp movement, apply to world, bump tick
                     let (new_x, new_y) = match ci.cmd {
                         ClientCmd::Move { mut dx, mut dy } => {
-                            // Clamp per-tick displacement to kill speed/teleport hacks.
+                            // Per-tick displacement cap (anti-speedhack / anti-teleport).
                             const MAX_STEP: f32 = 1.0;
                             let mag2 = dx * dx + dy * dy;
                             if mag2 > (MAX_STEP * MAX_STEP) {
@@ -293,7 +279,10 @@ pub async fn client_port_task(
                         }
                     };
 
-                    // --- Phase 1: write back player state (scoped mutable borrow of entry) ---
+                    // tick advances for this authoritative state
+                    let new_tick = tick + 1;
+
+                    // Write back player state (scoped mutable borrow of entry).
                     {
                         let entry = guard.players.entry(ci.client_pub).or_insert(PlayerState {
                             x: 0.0,
@@ -304,22 +293,36 @@ pub async fn client_port_task(
                         entry.y = new_y;
                         entry.last_nonce = ci.client_nonce;
                     }
-                    // mutable borrow of that entry ends here
 
-                    // --- Phase 2: update rolling transcript tip in shared state ---
-                    // transcript_tip := sha256(prev_tip || bincode(ci))
+                    // Build an authoritative event for the transcript.
+                    // This is "what the GS actually says happened."
+                    let ev = AuthoritativeEvent::MoveResolved {
+                        who: ci.client_pub,
+                        x: new_x,
+                        y: new_y,
+                        tick: new_tick,
+                    };
+
+                    // Update rolling transcript tip:
+                    // new_tip = sha256(prev_tip || bincode(ci) || bincode(ev))
                     let mut ci_bytes =
                         bincode::serialize(&ci).expect("serialize ClientInput in GS");
-                    let mut both = Vec::with_capacity(prev_tip.len() + ci_bytes.len());
+                    let mut ev_bytes =
+                        bincode::serialize(&ev).expect("serialize AuthoritativeEvent in GS");
+
+                    let mut both =
+                        Vec::with_capacity(prev_tip.len() + ci_bytes.len() + ev_bytes.len());
                     both.extend_from_slice(&prev_tip);
                     both.append(&mut ci_bytes);
-                    let new_tip = sha256(&both);
+                    both.append(&mut ev_bytes);
 
+                    let new_tip = sha256(&both);
                     guard.receipt_tip = new_tip;
 
-                    // --- Phase 3: build multi-entity snapshot (you + others) ---
-                    tick += 1;
+                    // tick becomes visible to rest of code
+                    tick = new_tick;
 
+                    // Build snapshot with you + everyone else.
                     let mut others: Vec<([u8; 32], f32, f32)> =
                         Vec::with_capacity(guard.players.len().saturating_sub(1));
 
@@ -336,9 +339,9 @@ pub async fn client_port_task(
                     };
 
                     Ok(snapshot)
-                })(); // <- end of inner no-await block; mutex guard dropped here
+                })(); // end of no-await block; mutex dropped here
 
-                // If validation failed inside block, drop client.
+                // If validation or sim failed, drop client.
                 let snapshot = match step_res {
                     Ok(s) => s,
                     Err(()) => {
@@ -346,7 +349,7 @@ pub async fn client_port_task(
                     }
                 };
 
-                // Send the authoritative snapshot back to the client.
+                // Send authoritative snapshot to the client.
                 if let Err(e) = send_bin_tcp(&mut socket, &snapshot).await {
                     eprintln!("[GS] send WorldSnapshot to {peer_addr} failed: {e:?}");
                     break;

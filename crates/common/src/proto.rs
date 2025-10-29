@@ -2,9 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 
 /// Unified signature type: ed25519 signature bytes (64 bytes).
-/// We send some signatures as Vec<u8> for convenience in a few places
-/// (e.g. Heartbeat.sig_gs, ProtectedReceipt.sig_vs) where we haven't
-/// switched them to fixed [u8; 64] yet.
+/// Some sigs are still Vec<u8> (e.g. Heartbeat.sig_gs) and will eventually
+/// become [u8;64] everywhere.
 pub type Sig = Vec<u8>;
 
 /// GS → VS during admission.
@@ -86,10 +85,7 @@ pub enum ClientCmd {
     Move { dx: f32, dy: f32 },
 }
 
-/// Client → GS input packet (one per "frame"/tick).
-/// The client *must* staple a recent VS PlayTicket proof and sign
-/// the whole bundle, so GS can prove to VS "I only processed inputs
-/// while I was blessed."
+/// Client → GS input packet (one per "frame"/tick").
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ClientInput {
     /// Which GS session this input is for.
@@ -109,35 +105,37 @@ pub struct ClientInput {
     /// The actual command (Move, etc.).
     pub cmd: ClientCmd,
 
-    /// Ephemeral client pubkey (Ed25519) for this run/session.
+    /// Client pubkey (Ed25519, 32 bytes) representing this player.
     pub client_pub: [u8; 32],
 
-    /// Client signature (Ed25519, 64 bytes) over the canonical tuple:
-    /// (session_id,
-    ///  ticket_counter,
-    ///  ticket_sig_vs,
-    ///  client_nonce,
-    ///  cmd)
+    /// Client signature (Ed25519, 64 bytes) over canonical tuple:
+    /// (session_id, ticket_counter, ticket_sig_vs, client_nonce, cmd)
     #[serde(with = "BigArray")]
     pub client_sig: [u8; 64],
 }
 
-/// GS → client snapshot of game-relevant world state.
-/// This is now *multiplayer*.
+/// GS authoritative events that matter for transcript / audit / replay.
 ///
-/// - `you`: your authoritative server-side position
-/// - `others`: everyone else the GS currently knows about in this shard,
-///   expressed as (client_pub, x, y).
+/// Each tick GS turns ClientInput into actual sim state ("here is where you
+/// ended up", "who hit who for how much", etc.). We hash these events into
+/// `receipt_tip` so GS can't rewrite history later.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum AuthoritativeEvent {
+    MoveResolved {
+        who: [u8; 32],
+        x: f32,
+        y: f32,
+        tick: u64,
+    },
+}
+
+/// GS → client: snapshot of world state for rendering / HUD / etc.
+///
+/// This is what the future Vulkan/wgpu client will consume.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WorldSnapshot {
-    /// Monotonic "tick" for this connection.
     pub tick: u64,
-
-    /// Your own position per GS sim.
     pub you: (f32, f32),
-
-    /// Other visible entities in the shard.
-    /// Each entry: (client_pub, x, y)
     pub others: Vec<([u8; 32], f32, f32)>,
 }
 
@@ -154,6 +152,7 @@ pub enum ClientToGs {
 }
 
 /// Messages flowing GS -> Client over the local TCP link.
+/// We mostly send raw structs today, but this enum is here for evolution.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum GsToClient {
     ServerHello(ServerHello),
@@ -177,7 +176,7 @@ pub struct Heartbeat {
     /// GS local time in ms (used for debug / replay forensics).
     pub gs_time_ms: u64,
 
-    /// Rolling hash / commitment of all "accepted" client actions so far.
+    /// Rolling hash / commitment of all "accepted" events so far.
     pub receipt_tip: [u8; 32],
 
     /// Signature by GS's ephemeral session key over the canonical heartbeat bytes.
@@ -185,7 +184,6 @@ pub struct Heartbeat {
 }
 
 /// GS → VS: "Here's my current transcript digest at counter C."
-/// This lets VS issue an attestation that "I saw GS claim this state."
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TranscriptDigest {
     pub session_id: [u8; 16],
@@ -194,9 +192,7 @@ pub struct TranscriptDigest {
 }
 
 /// VS → GS in response to TranscriptDigest.
-/// VS signs what GS claimed, so GS can later prove to players (and to us)
-/// that it really was under VS oversight when it said "player X took damage",
-/// "player Y moved here", etc.
+/// VS signs what GS claimed so GS can't deny it later.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ProtectedReceipt {
     pub session_id: [u8; 16],
