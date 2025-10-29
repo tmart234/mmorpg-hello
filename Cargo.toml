@@ -4,6 +4,7 @@ members = [
     "crates/gs-sim",
     "crates/vs",
     "crates/tools",
+    "crates/client",
 ]
 resolver = "2"
 

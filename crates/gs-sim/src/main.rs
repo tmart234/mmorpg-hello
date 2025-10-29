@@ -1,9 +1,29 @@
-//! gs-sim: minimal untrusted Game Server simulator
-//! - Attests its binary hash (dev-level)
-//! - Joins VS with both long-term GS key and a fresh per-session ephemeral key
-//! - Sends signed heartbeats using the ephemeral session key
-//! - Listens for PlayTickets from VS, verifies them, caches latest
-//! - (new) mock client-input gate: require fresh PlayTicket from VS
+// gs-sim: minimal game server simulator.
+//
+// Responsibilities right now:
+//
+// 1. Join the Validation Server (VS) over QUIC.
+//    - Send JoinRequest proving long-term GS key.
+//    - VS replies JoinAccept with session_id + sig_vs.
+//
+// 2. Stream heartbeats to VS signed with an ephemeral session key (ephemeral_pub).
+//
+// 3. Receive PlayTickets from VS. Each ticket says:
+//    "this GS session is blessed and still alive."
+//    - We verify VS signatures and build a hash chain.
+//
+// 4. Expose a local TCP "client port" on 127.0.0.1:50000.
+//    - A fake client (client-sim) connects.
+//    - We send it the freshest PlayTicket plus vs_pub in a ServerHello.
+//    - Client verifies sig_vs, then sends back ClientInput stapled to that ticket.
+//    - We verify that input and log success.
+//
+// tools/smoke does end-to-end:
+//  - start VS
+//  - start gs-sim --test-once
+//  - start client-sim --smoke-test
+//  - assert everyone can prove trust to everyone else
+//  - exit cleanly
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
@@ -11,8 +31,8 @@ use common::{
     crypto::{
         file_sha256, heartbeat_sign_bytes, join_request_sign_bytes, now_ms, sha256, sign, verify,
     },
-    framing::{recv_msg, send_msg},
-    proto::{Heartbeat, JoinAccept, JoinRequest, PlayTicket, Sig},
+    framing::{recv_msg, send_msg}, // QUIC bincode framing
+    proto::{ClientInput, Heartbeat, JoinAccept, JoinRequest, PlayTicket, ServerHello, Sig},
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use quinn::{ClientConfig, Connection, Endpoint};
@@ -22,11 +42,15 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
-use tokio::{sync::Mutex, time::sleep};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    time::sleep,
+};
 
 #[derive(Parser, Debug)]
 struct Opts {
@@ -34,7 +58,7 @@ struct Opts {
     #[arg(long, default_value = "127.0.0.1:4444")]
     vs: String,
 
-    /// Exit after first join/heartbeat/ticket
+    /// Exit after first join/heartbeat/ticket/client-proof exchange.
     #[arg(long)]
     test_once: bool,
 
@@ -42,71 +66,78 @@ struct Opts {
     #[arg(long, default_value = "gs-sim-local")]
     gs_id: String,
 
-    /// Paths to GS long-term keypair
+    /// Paths to GS *long-term* keypair
     #[arg(long, default_value = "keys/gs_ed25519.pk8")]
     gs_sk: String,
     #[arg(long, default_value = "keys/gs_ed25519.pub")]
     gs_pk: String,
 }
 
+/// Shared GS runtime state we expose to the local client port.
+struct GsSharedState {
+    session_id: [u8; 16],
+    vs_pub: [u8; 32],
+    latest_ticket: Option<PlayTicket>,
+    last_client_nonce: u64,
+}
+
+impl GsSharedState {
+    fn new(session_id: [u8; 16], vs_pub: [u8; 32]) -> Self {
+        Self {
+            session_id,
+            vs_pub,
+            latest_ticket: None,
+            last_client_nonce: 0,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let opts = Opts::parse();
 
-    // --- 1. Load or generate GS long-term identity keypair ---
-    let (gs_sk, gs_pk) = load_or_make_keys(&opts.gs_sk, &opts.gs_pk)?;
+    // 1. Load/generate long-term GS identity keypair.
+    let (gs_sk_long, gs_pk_long) = load_or_make_keys(&opts.gs_sk, &opts.gs_pk)?;
 
-    // --- 2. Generate fresh per-session ephemeral keypair ---
-    // This one is NOT persisted. It lives only for this VS session.
+    // 2. Generate per-session ephemeral signing key.
+    //    VS will bind this key to the session for runtime auth (heartbeats).
     let eph_sk = SigningKey::generate(&mut OsRng);
-    let eph_pk = eph_sk.verifying_key();
-    let eph_pub_bytes = eph_pk.to_bytes(); // [u8;32]
+    let eph_pub_bytes = eph_sk.verifying_key().to_bytes();
 
-    // --- 3. Compute dev "attestation" hash of this running binary ---
+    // 3. Compute "attestation" hash of this binary (dev placeholder).
     let exe = std::env::current_exe()?;
     let sw_hash = file_sha256(&exe)?;
 
-    // --- 4. QUIC client endpoint + connect to VS ---
+    // 4. QUIC endpoint + connect to VS.
     let (endpoint, server_addr) = make_endpoint_and_addr(&opts.vs)?;
     let conn: Connection = endpoint
         .connect_with(make_client_cfg_insecure()?, server_addr, "vs.dev")?
         .await?;
     println!("[GS] connected to VS at {server_addr}");
 
-    // --- 5. Build and send JoinRequest on fresh bi-stream ---
+    // 5. Send JoinRequest on a fresh bi-stream.
     let mut nonce = [0u8; 16];
     OsRng.fill_bytes(&mut nonce);
 
     let now = now_ms();
-
-    // The JoinRequest is authenticated by the *long-term* GS key.
-    // The signed message includes the ephemeral_pub, so VS learns:
-    // "This GS identity vouches that this ephemeral key is legit for this session."
-    let to_sign = join_request_sign_bytes(
-        &opts.gs_id,
-        &sw_hash,
-        now,
-        &nonce,
-        &eph_pub_bytes, // new extra param
-    );
-    let sig_gs: Sig = sign(&gs_sk, &to_sign);
+    let to_sign = join_request_sign_bytes(&opts.gs_id, &sw_hash, now, &nonce, &eph_pub_bytes);
+    let sig_gs: Sig = sign(&gs_sk_long, &to_sign);
 
     let jr = JoinRequest {
         gs_id: opts.gs_id.clone(),
         sw_hash,
         t_unix_ms: now,
         nonce,
-        ephemeral_pub: eph_pub_bytes, // new field
+        ephemeral_pub: eph_pub_bytes,
         sig_gs,
-        gs_pub: gs_pk.to_bytes(),
+        gs_pub: gs_pk_long.to_bytes(),
     };
 
     let (mut jsend, mut jrecv) = conn.open_bi().await?;
     send_msg(&mut jsend, &jr).await?;
     let ja: JoinAccept = recv_msg(&mut jrecv).await?;
 
-    // --- 6. Verify VS proved identity over this session_id ---
-    // GS will trust tickets from this VS key going forward.
+    // 6. Verify VS proved identity in JoinAccept.
     let vs_vk = VerifyingKey::from_bytes(&ja.vs_pub).context("bad vs_pub from JoinAccept")?;
     let sig_ok = verify(&vs_vk, &ja.session_id, &ja.sig_vs);
     if !sig_ok {
@@ -119,45 +150,47 @@ async fn main() -> Result<()> {
         ja.sig_vs.len()
     );
 
-    // --- 7. Shared state: the most recent blessed PlayTicket from VS ---
-    // We'll demand clients echo this with every input.
-    let latest_ticket: Arc<Mutex<Option<PlayTicket>>> = Arc::new(Mutex::new(None));
+    // 7. Shared state so:
+    //    - ticket_listener() can stash latest PlayTicket
+    //    - client_port_task() can hand it to client-sim and verify ClientInput
+    let shared = Arc::new(Mutex::new(GsSharedState::new(ja.session_id, ja.vs_pub)));
 
-    // --- 8. Spawn background tasks ---
-
-    // 8a. Heartbeat loop GS -> VS
-    // IMPORTANT: heartbeats are signed with *ephemeral* key,
-    // not the long-term GS key. VS will verify using ephemeral_pub
-    // we handed over in JoinRequest.
+    // 8. Spawn runtime tasks:
+    //    a) heartbeat_loop: GS → VS liveness every ~2s
+    //    b) ticket_listener: VS → GS PlayTickets every ~2s
+    //    c) client_port_task: tiny TCP server for client-sim
     let hb_counter = Arc::new(AtomicU64::new(0));
-    let hb_task = tokio::spawn(heartbeat_loop(
+    let heartbeat_task = tokio::spawn(heartbeat_loop(
         conn.clone(),
         hb_counter.clone(),
-        eph_sk.clone(), // <-- ephemeral signer for runtime liveness
+        eph_sk.clone(),
         ja.session_id,
     ));
 
-    // 8b. Ticket listener VS -> GS
-    // Verifies PlayTickets, enforces continuity, caches newest ticket.
-    let ticket_task = tokio::spawn(ticket_listener(
-        conn.clone(),
-        ja.session_id,
-        vs_vk,
-        latest_ticket.clone(),
-    ));
+    let tickets_task = tokio::spawn(ticket_listener(conn.clone(), shared.clone(), vs_vk));
 
+    let client_port_task_handle = tokio::spawn(client_port_task(shared.clone()));
+
+    // 9. --test-once mode: sleep a bit so smoke can poke us, then exit 0.
     if opts.test_once {
-        // let a couple heartbeats/tickets flow, then simulate client input enforcement
         sleep(Duration::from_secs(5)).await;
-        mock_client_input_check(latest_ticket.clone()).await;
+
+        // Kill background tasks explicitly so clippy doesn't complain
+        heartbeat_task.abort();
+        tickets_task.abort();
+        client_port_task_handle.abort();
+
         println!("[GS] test_once complete.");
         return Ok(());
     }
 
-    // 8c. Stay alive while background tasks run; bail if either dies.
+    // 10. prod-ish mode: run until a background task dies.
     loop {
         sleep(Duration::from_secs(60)).await;
-        if hb_task.is_finished() || ticket_task.is_finished() {
+        if heartbeat_task.is_finished()
+            || tickets_task.is_finished()
+            || client_port_task_handle.is_finished()
+        {
             eprintln!("[GS] background task ended, exiting main loop");
             break;
         }
@@ -166,16 +199,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// GS -> VS heartbeat loop.
-// Opens a fresh bi-stream for each heartbeat,
-// signs heartbeat with the *ephemeral* session key.
+/// Heartbeats GS→VS, signed with the ephemeral per-session key.
 async fn heartbeat_loop(
     conn: Connection,
     counter: Arc<AtomicU64>,
-    eph_sk: SigningKey, // now the ephemeral signer
+    eph_sk: SigningKey,
     session_id: [u8; 16],
 ) -> Result<()> {
-    let receipt_tip = [0u8; 32]; // placeholder, no receipts yet
+    let receipt_tip = [0u8; 32]; // placeholder
 
     loop {
         sleep(Duration::from_secs(2)).await;
@@ -184,7 +215,7 @@ async fn heartbeat_loop(
         let now = now_ms();
 
         let to_sign = heartbeat_sign_bytes(&session_id, c, now, &receipt_tip);
-        let sig_gs = sign(&eph_sk, &to_sign); // signed with eph_sk
+        let sig_gs = sign(&eph_sk, &to_sign);
 
         let hb = Heartbeat {
             session_id,
@@ -194,13 +225,14 @@ async fn heartbeat_loop(
             sig_gs,
         };
 
-        // open a new bi-stream for each heartbeat
         let pair = conn.open_bi().await;
-        if let Err(e) = pair {
-            eprintln!("[GS] heartbeat open_bi failed: {e:?}");
-            break;
-        }
-        let (mut send, _recv) = pair.unwrap();
+        let (mut send, _recv) = match pair {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[GS] heartbeat open_bi failed: {e:?}");
+                break;
+            }
+        };
 
         if let Err(e) = send_msg(&mut send, &hb).await {
             eprintln!("[GS] heartbeat send failed: {e:?}");
@@ -212,20 +244,17 @@ async fn heartbeat_loop(
     Ok(())
 }
 
-// VS -> GS ticket listener.
-// Accepts PlayTickets from VS, verifies signature, chain, timing,
-// and records the latest good ticket for use when checking client inputs.
+/// VS → GS PlayTickets. We verify VS sig and chain, then stash
+/// latest ticket into shared so the client_port_task can hand it to clients.
 async fn ticket_listener(
     conn: Connection,
-    session_id: [u8; 16],
+    shared: Arc<Mutex<GsSharedState>>,
     vs_pub: VerifyingKey,
-    latest_ticket: Arc<Mutex<Option<PlayTicket>>>,
 ) -> Result<()> {
     let mut last_counter: u64 = 0;
     let mut last_hash: [u8; 32] = [0u8; 32];
 
     loop {
-        // VS opens a fresh bi-stream for each PlayTicket.
         let pair = conn.accept_bi().await;
         let (send, mut recv) = match pair {
             Ok(p) => p,
@@ -234,10 +263,9 @@ async fn ticket_listener(
                 break;
             }
         };
-        drop(send); // we don't send data on ticket stream
+        drop(send);
 
-        let pt_res = recv_msg::<PlayTicket>(&mut recv).await;
-        let pt = match pt_res {
+        let pt = match recv_msg::<PlayTicket>(&mut recv).await {
             Ok(pt) => pt,
             Err(e) => {
                 eprintln!("[GS] bad ticket: {e:?}");
@@ -245,13 +273,7 @@ async fn ticket_listener(
             }
         };
 
-        // 1. session binding
-        if pt.session_id != session_id {
-            eprintln!("[GS] ticket session mismatch");
-            break;
-        }
-
-        // 2. counter monotonic
+        // 1. counter must strictly increase
         if pt.counter != last_counter + 1 {
             eprintln!(
                 "[GS] ticket counter non-monotonic (got {}, expected {})",
@@ -261,13 +283,13 @@ async fn ticket_listener(
             break;
         }
 
-        // 3. prev_ticket_hash continuity
+        // 2. prev_ticket_hash continuity (chain)
         if pt.prev_ticket_hash != last_hash {
             eprintln!("[GS] ticket prev_hash mismatch");
             break;
         }
 
-        // 4. verify VS signature on the ticket body (minus sig_vs)
+        // 3. verify VS sig on ticket body
         let body_tuple = (
             pt.session_id,
             pt.client_binding,
@@ -282,72 +304,155 @@ async fn ticket_listener(
             break;
         }
 
-        // 5. freshness window
+        // 4. time window sanity (for logging)
         let now = now_ms();
-        let ok_time = pt.not_before_ms.saturating_sub(500) <= now
+        let fresh = pt.not_before_ms.saturating_sub(500) <= now
             && now <= pt.not_after_ms.saturating_add(500);
 
-        println!("[GS] ticket #{} (time_ok={})", pt.counter, ok_time);
+        println!("[GS] ticket #{} (time_ok={})", pt.counter, fresh);
 
-        // 6. update continuity chain for next ticket
+        // 5. update continuity
         last_counter = pt.counter;
         last_hash = sha256(&body_bytes);
 
-        // 7. publish newest valid ticket so client inputs must echo it
+        // 6. stash for client_port_task
         {
-            let mut guard = latest_ticket.lock().await;
-            *guard = Some(pt.clone());
+            let mut guard = shared.lock().unwrap();
+            guard.latest_ticket = Some(pt.clone());
         }
     }
 
     Ok(())
 }
 
-// Pretend we got input from a client.
-// Before trusting that input, GS would demand the client echo the latest
-// VS-blessed PlayTicket (or its counter + sig_vs).
-//
-// We don't have a client crate yet, so here we just read whatever the
-// latest ticket is and log what we would enforce.
-async fn mock_client_input_check(latest_ticket: Arc<Mutex<Option<PlayTicket>>>) {
-    let snapshot = {
-        let guard = latest_ticket.lock().await;
-        guard.clone()
+/// Local TCP port for clients.
+/// Protocol:
+///   GS waits until it has a ticket from VS,
+///   then for first incoming TCP client:
+///     - send ServerHello {session_id, ticket, vs_pub}
+///     - recv ClientInput
+///     - verify stapled proof (ticket + nonce)
+async fn client_port_task(shared: Arc<Mutex<GsSharedState>>) -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:50000")
+        .await
+        .context("bind client port 50000")?;
+    println!("[GS] client port listening on 127.0.0.1:50000");
+
+    // accept exactly one client for smoke
+    let (mut sock, peer_addr) = listener.accept().await.context("accept client-sim")?;
+    println!("[GS] client-sim connected from {peer_addr}");
+
+    // per-connection framing helpers for this TCP stream
+    async fn tcp_send_msg<T: serde::Serialize>(sock: &mut TcpStream, msg: &T) -> Result<()> {
+        let buf = bincode::serialize(msg)?;
+        let len = buf.len() as u32;
+        sock.write_all(&len.to_le_bytes()).await?;
+        sock.write_all(&buf).await?;
+        Ok(())
+    }
+
+    async fn tcp_recv_msg<T: serde::de::DeserializeOwned>(sock: &mut TcpStream) -> Result<T> {
+        let mut len_bytes = [0u8; 4];
+        sock.read_exact(&mut len_bytes).await?;
+        let len = u32::from_le_bytes(len_bytes) as usize;
+
+        let mut buf = vec![0u8; len];
+        sock.read_exact(&mut buf).await?;
+
+        let msg: T = bincode::deserialize(&buf)?;
+        Ok(msg)
+    }
+
+    // wait until we have at least one PlayTicket from VS
+    let (session_id, vs_pub, ticket) = loop {
+        {
+            let guard = shared.lock().unwrap();
+            if let Some(t) = &guard.latest_ticket {
+                break (guard.session_id, guard.vs_pub, t.clone());
+            }
+        }
+        sleep(Duration::from_millis(50)).await;
     };
 
-    match snapshot {
-        Some(t) => {
-            let now = now_ms();
-            let fresh = t.not_before_ms.saturating_sub(500) <= now
-                && now <= t.not_after_ms.saturating_add(500);
+    // send ServerHello
+    let hello = ServerHello {
+        session_id,
+        ticket: ticket.clone(),
+        vs_pub,
+    };
+    tcp_send_msg(&mut sock, &hello)
+        .await
+        .context("send ServerHello to client-sim")?;
 
-            println!(
-                "[GS] mock client input validation: would accept ticket #{} (fresh={}) for session {}..",
-                t.counter,
-                fresh,
-                hex::encode(&t.session_id[..4]),
-            );
+    // recv one ClientInput
+    let ci: ClientInput = tcp_recv_msg(&mut sock)
+        .await
+        .context("recv ClientInput from client-sim")?;
 
-            // Future real check:
-            // - client must include t.counter and t.sig_vs on every input
-            // - reject if !fresh
+    // validate ClientInput
+    {
+        let mut guard = shared.lock().unwrap();
+
+        // 1. session must match
+        if ci.session_id != guard.session_id {
+            bail!("client-sim session_id mismatch");
         }
-        None => {
-            eprintln!(
-                "[GS] mock client input validation: no ticket yet, would reject client input"
-            );
+
+        // 2. must be using the most recent ticket
+        if ci.ticket_counter != ticket.counter {
+            bail!("client-sim used stale ticket");
         }
+        if ci.ticket_sig_vs != ticket.sig_vs {
+            bail!("client-sim sent wrong sig_vs");
+        }
+
+        // 3. verify VS actually signed that ticket body (defense-in-depth)
+        let body_tuple = (
+            ticket.session_id,
+            ticket.client_binding,
+            ticket.counter,
+            ticket.not_before_ms,
+            ticket.not_after_ms,
+            ticket.prev_ticket_hash,
+        );
+        let body_bytes = bincode::serialize(&body_tuple).context("ticket body serialize")?;
+
+        let vs_vk = VerifyingKey::from_bytes(&guard.vs_pub).context("vs_pub bad")?;
+        if !verify(&vs_vk, &body_bytes, &ticket.sig_vs) {
+            bail!("client-sim provided ticket_sig_vs that doesn't verify");
+        }
+
+        // 4. freshness window
+        let now = now_ms();
+        let still_fresh = ticket.not_before_ms.saturating_sub(500) <= now
+            && now <= ticket.not_after_ms.saturating_add(500);
+        if !still_fresh {
+            bail!("client-sim used stale/expired ticket");
+        }
+
+        // 5. anti-replay: nonce monotonic
+        if ci.client_nonce <= guard.last_client_nonce {
+            bail!("client-sim nonce not monotonic");
+        }
+        guard.last_client_nonce = ci.client_nonce;
+
+        println!(
+            "[GS] accepted client input {:?} (nonce={}, ticket_ctr={})",
+            ci.cmd, ci.client_nonce, ci.ticket_counter
+        );
     }
+
+    Ok(())
 }
 
-/// Load ed25519 keypair from disk or create new dev keys for the GS long-term identity.
+/// Load GS long-term Ed25519 keypair from disk or create dev keys.
 fn load_or_make_keys(sk_path: &str, pk_path: &str) -> Result<(SigningKey, VerifyingKey)> {
     let skp = PathBuf::from(sk_path);
     let pkp = PathBuf::from(pk_path);
 
     if skp.exists() && pkp.exists() {
-        let sk_bytes = std::fs::read(&skp)?;
-        let pk_bytes = std::fs::read(&pkp)?;
+        let sk_bytes = std::fs::read(&skp).context("read gs_sk")?;
+        let pk_bytes = std::fs::read(&pkp).context("read gs_pk")?;
 
         let sk = SigningKey::from_bytes(
             &sk_bytes
@@ -361,11 +466,11 @@ fn load_or_make_keys(sk_path: &str, pk_path: &str) -> Result<(SigningKey, Verify
         )?;
         Ok((sk, pk))
     } else {
-        std::fs::create_dir_all("keys")?;
+        std::fs::create_dir_all("keys").context("mkdir keys")?;
         let sk = SigningKey::generate(&mut OsRng);
         let pk = sk.verifying_key();
-        std::fs::write(&skp, sk.to_bytes())?;
-        std::fs::write(&pkp, pk.to_bytes())?;
+        std::fs::write(&skp, sk.to_bytes()).context("write gs_sk")?;
+        std::fs::write(&pkp, pk.to_bytes()).context("write gs_pk")?;
         println!(
             "[GS] generated dev keypair at {}, {}",
             skp.display(),
@@ -375,7 +480,7 @@ fn load_or_make_keys(sk_path: &str, pk_path: &str) -> Result<(SigningKey, Verify
     }
 }
 
-/// Dev-only: accept any server cert. Replace with real pinning for prod.
+/// Dev-only QUIC client config: accept any server cert.
 fn make_client_cfg_insecure() -> Result<ClientConfig> {
     use rustls::{
         client::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -424,14 +529,13 @@ fn make_client_cfg_insecure() -> Result<ClientConfig> {
     Ok(ClientConfig::new(Arc::new(tls_cfg)))
 }
 
-/// Create a Quinn client Endpoint bound to an ephemeral UDP port,
-/// matching IPv4/IPv6 family to VS.
+/// Create a Quinn client Endpoint bound to an ephemeral UDP port.
 fn make_endpoint_and_addr(vs: &str) -> Result<(Endpoint, SocketAddr)> {
     use quinn::{EndpointConfig, TokioRuntime};
 
     let server_addr: SocketAddr = vs.parse().context("bad vs address")?;
 
-    // Bind locally on same IP family as server.
+    // bind wildcards in the same family as VS
     let bind_ip = match server_addr {
         SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
@@ -443,7 +547,7 @@ fn make_endpoint_and_addr(vs: &str) -> Result<(Endpoint, SocketAddr)> {
 
     let endpoint = Endpoint::new(
         EndpointConfig::default(),
-        None, // client-only Endpoint, no server config
+        None, // client-only
         udp,
         Arc::new(TokioRuntime),
     )?;
