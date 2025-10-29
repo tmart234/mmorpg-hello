@@ -74,11 +74,15 @@ struct Opts {
 }
 
 /// Shared GS runtime state we expose to the local client port.
+// Replace the existing struct GsSharedState with this:
 struct GsSharedState {
     session_id: [u8; 16],
     vs_pub: [u8; 32],
     latest_ticket: Option<PlayTicket>,
     last_client_nonce: u64,
+
+    last_ticket_ms: u64, // last time we accepted a fresh PlayTicket
+    revoked: bool,       // set true if VS stops blessing
 }
 
 impl GsSharedState {
@@ -88,10 +92,11 @@ impl GsSharedState {
             vs_pub,
             latest_ticket: None,
             last_client_nonce: 0,
+            last_ticket_ms: 0,
+            revoked: false,
         }
     }
 }
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let opts = Opts::parse();
@@ -246,13 +251,47 @@ async fn heartbeat_loop(
 
 /// VS → GS PlayTickets. We verify VS sig and chain, then stash
 /// latest ticket into shared so the client_port_task can hand it to clients.
+// Replace the entire function with this:
 async fn ticket_listener(
     conn: Connection,
     shared: Arc<Mutex<GsSharedState>>,
     vs_pub: VerifyingKey,
 ) -> Result<()> {
+    // continuity
     let mut last_counter: u64 = 0;
     let mut last_hash: [u8; 32] = [0u8; 32];
+
+    // Spawn a tiny watchdog here that marks revoked if ticket stream stalls.
+    // 2.5s grace since tickets are ~2s apart.
+    {
+        let shared_for_watchdog = Arc::clone(&shared);
+        tokio::spawn(async move {
+            const LIVENESS_BUDGET_MS: u64 = 2_500;
+            loop {
+                sleep(Duration::from_millis(250)).await;
+                let (revoked_now, idle_ms) = {
+                    let guard = shared_for_watchdog.lock().unwrap();
+                    let last = guard.last_ticket_ms;
+                    let now = now_ms();
+                    let idle = now.saturating_sub(last);
+                    let should_revoke = last != 0 && idle > LIVENESS_BUDGET_MS;
+                    (should_revoke || guard.revoked, idle)
+                };
+
+                // flip the bit once
+                if revoked_now {
+                    let mut guard = shared_for_watchdog.lock().unwrap();
+                    if !guard.revoked {
+                        guard.revoked = true;
+                        eprintln!(
+                            "[GS] VS blessing lost (no fresh ticket in {} ms) → session revoked",
+                            idle_ms
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     loop {
         let pair = conn.accept_bi().await;
@@ -263,9 +302,10 @@ async fn ticket_listener(
                 break;
             }
         };
-        drop(send);
+        drop(send); // GS doesn't send back on ticket streams.
 
-        let pt = match recv_msg::<PlayTicket>(&mut recv).await {
+        let pt_res = recv_msg::<PlayTicket>(&mut recv).await;
+        let pt = match pt_res {
             Ok(pt) => pt,
             Err(e) => {
                 eprintln!("[GS] bad ticket: {e:?}");
@@ -273,7 +313,7 @@ async fn ticket_listener(
             }
         };
 
-        // 1. counter must strictly increase
+        // 1) counter must strictly increase
         if pt.counter != last_counter + 1 {
             eprintln!(
                 "[GS] ticket counter non-monotonic (got {}, expected {})",
@@ -283,13 +323,13 @@ async fn ticket_listener(
             break;
         }
 
-        // 2. prev_ticket_hash continuity (chain)
+        // 2) prev_ticket_hash continuity (chain)
         if pt.prev_ticket_hash != last_hash {
             eprintln!("[GS] ticket prev_hash mismatch");
             break;
         }
 
-        // 3. verify VS sig on ticket body
+        // 3) verify VS sig on ticket body
         let body_tuple = (
             pt.session_id,
             pt.client_binding,
@@ -304,21 +344,22 @@ async fn ticket_listener(
             break;
         }
 
-        // 4. time window sanity (for logging)
+        // 4) time window sanity
         let now = now_ms();
         let fresh = pt.not_before_ms.saturating_sub(500) <= now
             && now <= pt.not_after_ms.saturating_add(500);
 
         println!("[GS] ticket #{} (time_ok={})", pt.counter, fresh);
 
-        // 5. update continuity
+        // 5) update continuity
         last_counter = pt.counter;
         last_hash = sha256(&body_bytes);
 
-        // 6. stash for client_port_task
+        // 6) stash for client_port_task + bump liveness clock
         {
             let mut guard = shared.lock().unwrap();
             guard.latest_ticket = Some(pt.clone());
+            guard.last_ticket_ms = now; // mark “we’re freshly blessed”
         }
     }
 
@@ -336,32 +377,10 @@ async fn client_port_task(shared: Arc<Mutex<GsSharedState>>) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:50000")
         .await
         .context("bind client port 50000")?;
-    println!("[GS] client port listening on 127.0.0.1:50000");
 
     // accept exactly one client for smoke
     let (mut sock, peer_addr) = listener.accept().await.context("accept client-sim")?;
-    println!("[GS] client-sim connected from {peer_addr}");
-
-    // per-connection framing helpers for this TCP stream
-    async fn tcp_send_msg<T: serde::Serialize>(sock: &mut TcpStream, msg: &T) -> Result<()> {
-        let buf = bincode::serialize(msg)?;
-        let len = buf.len() as u32;
-        sock.write_all(&len.to_le_bytes()).await?;
-        sock.write_all(&buf).await?;
-        Ok(())
-    }
-
-    async fn tcp_recv_msg<T: serde::de::DeserializeOwned>(sock: &mut TcpStream) -> Result<T> {
-        let mut len_bytes = [0u8; 4];
-        sock.read_exact(&mut len_bytes).await?;
-        let len = u32::from_le_bytes(len_bytes) as usize;
-
-        let mut buf = vec![0u8; len];
-        sock.read_exact(&mut buf).await?;
-
-        let msg: T = bincode::deserialize(&buf)?;
-        Ok(msg)
-    }
+    println!("[GS] client-sim connected from {}", peer_addr);
 
     // wait until we have at least one PlayTicket from VS
     let (session_id, vs_pub, ticket) = loop {
@@ -374,7 +393,15 @@ async fn client_port_task(shared: Arc<Mutex<GsSharedState>>) -> Result<()> {
         sleep(Duration::from_millis(50)).await;
     };
 
-    // send ServerHello
+    // If already revoked before first hello, reject immediately.
+    {
+        let guard = shared.lock().unwrap();
+        if guard.revoked {
+            bail!("session already revoked (no fresh tickets)");
+        }
+    }
+
+    // send ServerHello over TCP
     let hello = ServerHello {
         session_id,
         ticket: ticket.clone(),
@@ -384,62 +411,85 @@ async fn client_port_task(shared: Arc<Mutex<GsSharedState>>) -> Result<()> {
         .await
         .context("send ServerHello to client-sim")?;
 
-    // recv one ClientInput
-    let ci: ClientInput = tcp_recv_msg(&mut sock)
-        .await
-        .context("recv ClientInput from client-sim")?;
+    // Now stay in a loop to receive multiple ClientInput packets
+    loop {
+        // Try to receive the next input from this client.
+        let ci: ClientInput = match tcp_recv_msg(&mut sock).await {
+            Ok(ci) => ci,
+            Err(e) => {
+                // If client closed or errored, we're done.
+                eprintln!("[GS] client_port_task recv error / disconnect: {e:?}");
+                break;
+            }
+        };
 
-    // validate ClientInput
-    {
-        let mut guard = shared.lock().unwrap();
+        // Validate this input against current shared state.
+        // We do all checks without `.await` while holding the lock briefly.
+        let res = {
+            let mut guard = shared.lock().unwrap();
 
-        // 1. session must match
-        if ci.session_id != guard.session_id {
-            bail!("client-sim session_id mismatch");
+            // 0) session not revoked
+            if guard.revoked {
+                Err(anyhow!("session revoked: rejecting client input"))
+            }
+            // 1) session must match
+            else if ci.session_id != guard.session_id {
+                Err(anyhow!("client-sim session_id mismatch"))
+            }
+            // 2) must be using the most recent ticket we handed out
+            else if ci.ticket_counter != ticket.counter {
+                Err(anyhow!("client-sim used stale ticket"))
+            } else if ci.ticket_sig_vs != ticket.sig_vs {
+                Err(anyhow!("client-sim sent wrong sig_vs"))
+            } else {
+                // 3) verify VS actually signed that ticket body (defense in depth)
+                let body_tuple = (
+                    ticket.session_id,
+                    ticket.client_binding,
+                    ticket.counter,
+                    ticket.not_before_ms,
+                    ticket.not_after_ms,
+                    ticket.prev_ticket_hash,
+                );
+                let body_bytes =
+                    bincode::serialize(&body_tuple).context("ticket body serialize")?;
+
+                let vs_vk = VerifyingKey::from_bytes(&guard.vs_pub).context("vs_pub bad")?;
+                if !verify(&vs_vk, &body_bytes, &ticket.sig_vs) {
+                    Err(anyhow!(
+                        "client-sim provided ticket_sig_vs that doesn't verify"
+                    ))
+                } else {
+                    // 4) anti-replay: nonce monotonic
+                    if ci.client_nonce <= guard.last_client_nonce {
+                        Err(anyhow!("client-sim nonce not monotonic"))
+                    } else {
+                        // 5) ticket still fresh *now*
+                        let now = now_ms();
+                        let fresh_now = ticket.not_before_ms.saturating_sub(500) <= now
+                            && now <= ticket.not_after_ms.saturating_add(500);
+                        if !fresh_now {
+                            Err(anyhow!("client-sim ticket is not fresh at input time"))
+                        } else {
+                            // success: record nonce and log
+                            guard.last_client_nonce = ci.client_nonce;
+                            println!(
+                                "[GS] accepted client input {:?} (nonce={}, ticket_ctr={})",
+                                ci.cmd, ci.client_nonce, ci.ticket_counter
+                            );
+                            Ok(())
+                        }
+                    }
+                }
+            }
+        };
+
+        if let Err(e) = res {
+            eprintln!("[GS] rejecting client input: {e:?}");
+            break;
         }
 
-        // 2. must be using the most recent ticket
-        if ci.ticket_counter != ticket.counter {
-            bail!("client-sim used stale ticket");
-        }
-        if ci.ticket_sig_vs != ticket.sig_vs {
-            bail!("client-sim sent wrong sig_vs");
-        }
-
-        // 3. verify VS actually signed that ticket body (defense-in-depth)
-        let body_tuple = (
-            ticket.session_id,
-            ticket.client_binding,
-            ticket.counter,
-            ticket.not_before_ms,
-            ticket.not_after_ms,
-            ticket.prev_ticket_hash,
-        );
-        let body_bytes = bincode::serialize(&body_tuple).context("ticket body serialize")?;
-
-        let vs_vk = VerifyingKey::from_bytes(&guard.vs_pub).context("vs_pub bad")?;
-        if !verify(&vs_vk, &body_bytes, &ticket.sig_vs) {
-            bail!("client-sim provided ticket_sig_vs that doesn't verify");
-        }
-
-        // 4. freshness window
-        let now = now_ms();
-        let still_fresh = ticket.not_before_ms.saturating_sub(500) <= now
-            && now <= ticket.not_after_ms.saturating_add(500);
-        if !still_fresh {
-            bail!("client-sim used stale/expired ticket");
-        }
-
-        // 5. anti-replay: nonce monotonic
-        if ci.client_nonce <= guard.last_client_nonce {
-            bail!("client-sim nonce not monotonic");
-        }
-        guard.last_client_nonce = ci.client_nonce;
-
-        println!(
-            "[GS] accepted client input {:?} (nonce={}, ticket_ctr={})",
-            ci.cmd, ci.client_nonce, ci.ticket_counter
-        );
+        // loop continues and waits for next ClientInput
     }
 
     Ok(())
@@ -553,4 +603,25 @@ fn make_endpoint_and_addr(vs: &str) -> Result<(Endpoint, SocketAddr)> {
     )?;
 
     Ok((endpoint, server_addr))
+}
+
+async fn tcp_recv_msg<T: serde::de::DeserializeOwned>(sock: &mut TcpStream) -> Result<T> {
+    let mut len_bytes = [0u8; 4];
+    sock.read_exact(&mut len_bytes).await?;
+    let len = u32::from_le_bytes(len_bytes) as usize;
+
+    let mut buf = vec![0u8; len];
+    sock.read_exact(&mut buf).await?;
+
+    let msg: T = bincode::deserialize(&buf)?;
+    Ok(msg)
+}
+
+async fn tcp_send_msg<T: serde::Serialize>(sock: &mut TcpStream, msg: &T) -> Result<()> {
+    let buf = bincode::serialize(msg)?;
+    let len = buf.len() as u32;
+
+    sock.write_all(&len.to_le_bytes()).await?;
+    sock.write_all(&buf).await?;
+    Ok(())
 }
