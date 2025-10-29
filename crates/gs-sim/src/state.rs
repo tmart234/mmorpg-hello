@@ -1,6 +1,18 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use common::proto::PlayTicket;
+
+/// Per-player authoritative state tracked by the GS.
+/// Keyed in the map by the player's `[u8; 32]` public key.
+pub struct PlayerState {
+    pub x: f32,
+    pub y: f32,
+
+    /// Last strictly-increasing nonce we've accepted from this client.
+    /// Used for per-client anti-replay / ordering checks.
+    pub last_nonce: u64,
+}
 
 /// Global mutable GS session state shared across tasks.
 ///
@@ -29,9 +41,9 @@ pub struct GsSharedState {
     /// ticket_listener/watchdog flips this to true if tickets stop or VS says kill it.
     pub revoked: bool,
 
-    /// Last monotonic client_nonce we've accepted from *any* client.
-    /// Lets us reject replayed or out-of-order client inputs immediately.
-    pub last_client_nonce: u64,
+    /// Authoritative state for ALL known players in this shard,
+    /// keyed by their `[u8; 32]` client_pub.
+    pub players: HashMap<[u8; 32], PlayerState>,
 }
 
 impl GsSharedState {
@@ -43,7 +55,7 @@ impl GsSharedState {
             last_ticket_ms: 0,
             receipt_tip: [0u8; 32],
             revoked: false,
-            last_client_nonce: 0,
+            players: HashMap::new(),
         }
     }
 }

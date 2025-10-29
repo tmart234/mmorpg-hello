@@ -122,14 +122,23 @@ pub struct ClientInput {
     pub client_sig: [u8; 64],
 }
 
-/// GS → client: tiny "world state" echo so the client can render something.
-/// This is placeholder game state.
+/// GS → client snapshot of game-relevant world state.
+/// This is now *multiplayer*.
+///
+/// - `you`: your authoritative server-side position
+/// - `others`: everyone else the GS currently knows about in this shard,
+///   expressed as (client_pub, x, y).
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WorldSnapshot {
-    pub session_id: [u8; 16],
+    /// Monotonic "tick" for this connection.
     pub tick: u64,
-    pub player_x: f32,
-    pub player_y: f32,
+
+    /// Your own position per GS sim.
+    pub you: (f32, f32),
+
+    /// Other visible entities in the shard.
+    /// Each entry: (client_pub, x, y)
+    pub others: Vec<([u8; 32], f32, f32)>,
 }
 
 /// GS → client: "Here's a fresher PlayTicket from VS, use this now."
