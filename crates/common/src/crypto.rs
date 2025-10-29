@@ -1,4 +1,4 @@
-use crate::proto::Sig;
+use crate::proto::{ClientCmd, PlayTicket};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256 as Sha2};
@@ -64,14 +64,6 @@ pub fn join_request_sign_bytes(
     bincode::serialize(&(gs_id, sw_hash, t_unix_ms, nonce, ephemeral_pub)).unwrap()
 }
 
-/// Canonical bytes the GS signs for each Heartbeat.
-/// We now also include `sw_hash` to prove we are still running the same binary.
-///
-/// (session_id,
-///  gs_counter,
-///  gs_time_ms,
-///  receipt_tip,
-///  sw_hash)
 pub fn heartbeat_sign_bytes(
     session_id: &[u8; 16],
     gs_counter: u64,
@@ -91,7 +83,7 @@ pub fn rolling_hash_update(prev: [u8; 32], event_bytes: &[u8]) -> [u8; 32] {
 
 /// Turn a runtime signature Vec<u8> (should be 64 bytes)
 /// into a fixed [u8; 64]. Returns None if it's the wrong length.
-pub fn sigvec_to_array64(sig: &Sig) -> Option<[u8; 64]> {
+pub fn sigvec_to_array64(sig: &crate::proto::Sig) -> Option<[u8; 64]> {
     if sig.len() != 64 {
         return None;
     }
@@ -125,7 +117,7 @@ pub fn client_input_sign_bytes(
 
     // command tag + payload
     match cmd {
-        crate::proto::ClientCmd::Move { dx, dy } => {
+        ClientCmd::Move { dx, dy } => {
             out.push(0u8); // variant tag for Move
             out.extend_from_slice(&dx.to_le_bytes());
             out.extend_from_slice(&dy.to_le_bytes());
@@ -133,4 +125,72 @@ pub fn client_input_sign_bytes(
     }
 
     out
+}
+
+/* -------------------------
+Shared ticket helpers
+------------------------- */
+
+/// Default ticket lifetime used by VS in dev.
+pub const DEFAULT_TICKET_LIFETIME_MS: u64 = 2_000;
+
+/// Canonical body tuple for PlayTicket signing/verification.
+#[inline]
+pub fn ticket_body_tuple(
+    session_id: &[u8; 16],
+    client_binding: &[u8; 32],
+    counter: u64,
+    not_before_ms: u64,
+    not_after_ms: u64,
+    prev_ticket_hash: &[u8; 32],
+) -> ([u8; 16], [u8; 32], u64, u64, u64, [u8; 32]) {
+    (
+        *session_id,
+        *client_binding,
+        counter,
+        not_before_ms,
+        not_after_ms,
+        *prev_ticket_hash,
+    )
+}
+
+/// Canonical body bytes for PlayTicket signing/verification.
+#[inline]
+pub fn ticket_body_bytes(
+    session_id: &[u8; 16],
+    client_binding: &[u8; 32],
+    counter: u64,
+    not_before_ms: u64,
+    not_after_ms: u64,
+    prev_ticket_hash: &[u8; 32],
+) -> Vec<u8> {
+    let t = ticket_body_tuple(
+        session_id,
+        client_binding,
+        counter,
+        not_before_ms,
+        not_after_ms,
+        prev_ticket_hash,
+    );
+    bincode::serialize(&t).expect("ticket_body_bytes serialize")
+}
+
+/// Compute next prev_ticket_hash from the *body bytes* we just signed.
+#[inline]
+pub fn ticket_hash_next(body_bytes: &[u8]) -> [u8; 32] {
+    sha256(body_bytes)
+}
+
+/// Verify the VS signature on a PlayTicket using the given VS public key.
+#[inline]
+pub fn verify_ticket_sig(vs_pub: &VerifyingKey, pt: &PlayTicket) -> bool {
+    let body = ticket_body_bytes(
+        &pt.session_id,
+        &pt.client_binding,
+        pt.counter,
+        pt.not_before_ms,
+        pt.not_after_ms,
+        &pt.prev_ticket_hash,
+    );
+    verify(vs_pub, &body, &pt.sig_vs)
 }
