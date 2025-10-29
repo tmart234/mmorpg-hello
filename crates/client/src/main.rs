@@ -31,15 +31,11 @@ use clap::Parser;
 use common::{
     crypto::now_ms,
     proto::{ClientCmd, ClientInput, ServerHello},
+    tcp_framing::{tcp_recv_msg, tcp_send_msg},
 };
 use ed25519_dalek::{Signature, VerifyingKey};
-use serde::{de::DeserializeOwned, Serialize};
 use std::time::Duration;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-    time::sleep,
-};
+use tokio::{net::TcpStream, time::sleep};
 
 #[derive(Parser, Debug)]
 struct Opts {
@@ -50,29 +46,6 @@ struct Opts {
     /// If set, we just run a short smoke loop, then exit.
     #[arg(long)]
     smoke_test: bool,
-}
-
-// --- framing helpers: tiny length-prefixed bincode over TCP ---
-
-async fn tcp_recv_msg<T: DeserializeOwned>(sock: &mut TcpStream) -> Result<T> {
-    let mut len_bytes = [0u8; 4];
-    sock.read_exact(&mut len_bytes).await?;
-    let len = u32::from_le_bytes(len_bytes) as usize;
-
-    let mut buf = vec![0u8; len];
-    sock.read_exact(&mut buf).await?;
-
-    let msg: T = bincode::deserialize(&buf)?;
-    Ok(msg)
-}
-
-async fn tcp_send_msg<T: Serialize>(sock: &mut TcpStream, msg: &T) -> Result<()> {
-    let buf = bincode::serialize(msg)?;
-    let len = buf.len() as u32;
-
-    sock.write_all(&len.to_le_bytes()).await?;
-    sock.write_all(&buf).await?;
-    Ok(())
 }
 
 #[tokio::main]
@@ -186,7 +159,7 @@ async fn main() -> Result<()> {
 
         next_nonce += 1;
 
-        // keep it light; pretend this is our frame/tick cadence
+        // pretend this is our frame/tick cadence
         sleep(Duration::from_millis(200)).await;
 
         // for smoke_test, we don't have to run forever.

@@ -1,10 +1,23 @@
-# Makefile at repo root (Windows-friendly)
+# Makefile at repo root
+
+# Detect Windows vs Unix-y environments for clean steps
+ifeq ($(OS),Windows_NT)
+	CLEAN_CMD = cargo clean && cmd /C del /F /Q Cargo.lock 2>nul || true
+else
+	CLEAN_CMD = cargo clean && rm -f Cargo.lock || true
+endif
 
 .PHONY: clean-lock-build
 clean-lock-build:
-	@echo Cleaning target/ and Cargo.lock...
+	@echo "Cleaning target/ and Cargo.lock (DEV-ONLY destructive clean)..."
+	$(CLEAN_CMD)
+	cargo fmt --all
+	cargo build --workspace --all-targets
+
+.PHONY: clean-build
+clean-build:
+	@echo "Cleaning target/ (non-destructive: keeps Cargo.lock)..."
 	cargo clean
-	-@cmd /C del /F /Q Cargo.lock 2>nul
 	cargo fmt --all
 	cargo build --workspace --all-targets
 
@@ -13,21 +26,30 @@ check:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets -- -D warnings
 
-# Run tests AND then run the smoke test (VS <-> gs-sim happy path)
+# Run tests AND the smoke test (VS <-> gs-sim <-> client-sim happy path)
 .PHONY: test-stage
 test-stage:
-	@echo Running cargo test...
+	@echo "Running cargo test..."
 	cargo test --workspace --all-targets
-	@echo Running smoke test \(\`vs\` + \`gs-sim --test-once\`\)...
+	@echo "Running smoke test (\`vs\` + \`gs-sim --test-once\` + \`client-sim --smoke-test\`)..."
+	cargo run -p tools --bin gen_keys
 	cargo run -p tools --bin smoke
 
-# One-shot "does matchmaking loop work" helper if you want to just try it
+# Quick local sanity (gen keys + run smoke only)
 .PHONY: sim-positive
 sim-positive:
 	cargo run -p tools --bin gen_keys
 	cargo run -p tools --bin smoke
 
-# CI-lite: build from clean, lint, run tests, run smoke
+# CI-lite: lint, build, test, smoke
+# This is what GitHub Actions should run.
 .PHONY: ci
-ci: clean-lock-build check test-stage
-	@echo CI-lite completed ✅
+ci:
+	@echo "Lint (fmt + clippy)..."
+	cargo fmt --all -- --check
+	cargo clippy --workspace --all-targets -- -D warnings
+	@echo "Build all targets..."
+	cargo build --workspace --all-targets
+	@echo "Run tests + smoke..."
+	$(MAKE) test-stage
+	@echo "CI-lite completed ✅"
