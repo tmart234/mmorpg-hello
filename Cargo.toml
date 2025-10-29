@@ -15,10 +15,10 @@ edition = "2021"
 anyhow = "1.0"
 tokio = { version = "1.48", features = ["full"] }
 
-quinn = { version = "0.10.2", features = ["runtime-tokio", "tls-rustls", "ring"] }
+quinn = { version = "0.11.9", features = ["runtime-tokio", "rustls-ring"] }
 
 # rustls, with "dangerous_configuration" so we can provide a custom cert verifier
-rustls = { version = "0.21", features = ["dangerous_configuration"] }
+rustls = { version = "0.23.34", features = ["ring"] }
 
 bincode = "1.3"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }

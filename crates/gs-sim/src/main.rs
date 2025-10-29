@@ -6,7 +6,7 @@ use common::{
     proto::{JoinAccept, JoinRequest, Sig},
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use quinn::{ClientConfig, Connection, Endpoint};
+use quinn::{Connection, Endpoint};
 use rand::{rngs::OsRng, RngCore};
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
@@ -50,6 +50,14 @@ struct Opts {
 #[tokio::main]
 async fn main() -> Result<()> {
     let opts = Opts::parse();
+
+    // rustls 0.23+: pick a crypto backend (ring) for this process.
+    // If we don't do this, rustls panics at runtime ("Could not automatically determine the process-level CryptoProvider").
+    {
+        use rustls::crypto::{ring, CryptoProvider};
+        CryptoProvider::install_default(ring::default_provider())
+            .expect("install ring CryptoProvider");
+    }
 
     //
     // 1. Load/generate GS long-term keypair.
@@ -152,7 +160,7 @@ async fn main() -> Result<()> {
     let client_port_task_handle = tokio::spawn(client_port_task(shared.clone(), revoke_rx.clone()));
 
     //
-    // 10. --test-once mode: let smoke test run a bit, then exit.
+    // 10. --test_once mode: let smoke test run a bit, then exit.
     //
     if opts.test_once {
         sleep(Duration::from_secs(5)).await;
@@ -217,24 +225,30 @@ fn load_or_make_keys(sk_path: &str, pk_path: &str) -> Result<(SigningKey, Verify
     }
 }
 
-/// Dev-only QUIC client config: accept any server cert.
-fn make_client_cfg_insecure() -> Result<ClientConfig> {
+/// Dev-only QUIC client config that skips cert verification.
+/// We do this because VS generates a fresh self-signed cert each run.
+fn make_client_cfg_insecure() -> Result<quinn::ClientConfig> {
     use rustls::{
-        client::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-        Certificate, ClientConfig as RustlsClientConfig, DigitallySignedStruct, ServerName,
+        client::{
+            danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+            ClientConfig as RustlsClientConfig,
+        },
+        pki_types::{CertificateDer, ServerName, UnixTime},
+        DigitallySignedStruct, SignatureScheme,
     };
-    use std::time::SystemTime;
 
+    // Our "trust anything" verifier. This is ONLY for local dev.
+    #[derive(Debug)]
     struct NoVerify;
+
     impl ServerCertVerifier for NoVerify {
         fn verify_server_cert(
             &self,
-            _end_entity: &Certificate,
-            _intermediates: &[Certificate],
-            _server_name: &ServerName,
-            _scts: &mut dyn Iterator<Item = &[u8]>,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
             _ocsp_response: &[u8],
-            _now: SystemTime,
+            _now: UnixTime,
         ) -> std::result::Result<ServerCertVerified, rustls::Error> {
             Ok(ServerCertVerified::assertion())
         }
@@ -242,7 +256,7 @@ fn make_client_cfg_insecure() -> Result<ClientConfig> {
         fn verify_tls12_signature(
             &self,
             _message: &[u8],
-            _cert: &Certificate,
+            _cert: &CertificateDer<'_>,
             _dss: &DigitallySignedStruct,
         ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
             Ok(HandshakeSignatureValid::assertion())
@@ -251,19 +265,34 @@ fn make_client_cfg_insecure() -> Result<ClientConfig> {
         fn verify_tls13_signature(
             &self,
             _message: &[u8],
-            _cert: &Certificate,
+            _cert: &CertificateDer<'_>,
             _dss: &DigitallySignedStruct,
         ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
             Ok(HandshakeSignatureValid::assertion())
         }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            // This can just advertise common schemes. We're not actually verifying.
+            vec![
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ED25519,
+                SignatureScheme::RSA_PSS_SHA256,
+            ]
+        }
     }
 
+    // rustls 0.23 "dangerous" builder API: plug in our NoVerify.
     let tls_cfg = RustlsClientConfig::builder()
-        .with_safe_defaults()
+        .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerify))
         .with_no_client_auth();
 
-    Ok(ClientConfig::new(Arc::new(tls_cfg)))
+    // Quinn 0.11 wants a quinn::crypto::ClientConfig (trait object),
+    // not raw rustls::ClientConfig. We wrap it.
+    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls_cfg))
+        .map_err(|e| anyhow!("QuicClientConfig::try_from: {e:?}"))?;
+
+    Ok(quinn::ClientConfig::new(Arc::new(quic_crypto)))
 }
 
 /// Create a Quinn client Endpoint bound to an ephemeral UDP port.
