@@ -178,7 +178,7 @@ dependencies = [
  "common",
  "ed25519-dalek",
  "hex",
- "serde",
+ "rand",
  "tokio",
 ]
 

@@ -13,6 +13,7 @@ use tokio::{
 
 use crate::state::Shared;
 
+/// VS → GS ticket stream, plus revocation watchdog.
 pub async fn ticket_listener(
     conn: Connection,
     shared: Shared,
@@ -22,7 +23,7 @@ pub async fn ticket_listener(
     let mut last_counter: u64 = 0;
     let mut last_hash: [u8; 32] = [0u8; 32];
 
-    // watchdog for liveness / revocation
+    // Watchdog marks revoked if we stop getting fresh tickets.
     {
         let shared_for_watchdog = shared.clone();
         let revoke_tx = revoke_tx.clone();
@@ -73,7 +74,7 @@ pub async fn ticket_listener(
             }
         };
 
-        // verify monotonic counter
+        // 1) monotonic counter
         if pt.counter != last_counter + 1 {
             eprintln!(
                 "[GS] ticket counter non-monotonic (got {}, expected {})",
@@ -83,13 +84,13 @@ pub async fn ticket_listener(
             break;
         }
 
-        // verify hash chain
+        // 2) hash chain continuity
         if pt.prev_ticket_hash != last_hash {
             eprintln!("[GS] ticket prev_hash mismatch");
             break;
         }
 
-        // verify VS signature of ticket body
+        // 3) VS signature check
         let body_tuple = (
             pt.session_id,
             pt.client_binding,
@@ -104,14 +105,13 @@ pub async fn ticket_listener(
             break;
         }
 
+        // publish freshest ticket
         let now = now_ms();
-
-        // publish this as the latest valid ticket
         {
             let mut guard = shared.lock().unwrap();
             guard.latest_ticket = Some(pt.clone());
             guard.last_ticket_ms = now;
-            // NOTE: once revoked, we do not auto-clear revoked here.
+            // once revoked=true we don't flip it back here
         }
 
         println!("[GS] ticket #{} (time_ok=true)", pt.counter);

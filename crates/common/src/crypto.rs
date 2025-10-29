@@ -71,3 +71,10 @@ pub fn heartbeat_sign_bytes(
 ) -> Vec<u8> {
     bincode::serialize(&(session_id, gs_counter, gs_time_ms, receipt_tip)).unwrap()
 }
+
+pub fn rolling_hash_update(prev: [u8; 32], event_bytes: &[u8]) -> [u8; 32] {
+    let mut h = Sha2::new();
+    h.update(prev);
+    h.update(event_bytes);
+    h.finalize().into()
+}

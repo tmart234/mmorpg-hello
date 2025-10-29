@@ -1,59 +1,63 @@
-//! vs: Validation Server
+//! Validation Server (VS)
 //!
-//! Preruntime
-//! - GS connects over QUIC.
-//! - GS sends JoinRequest {
-//!   gs_id,
-//!   sw_hash,
-//!   t_unix_ms,
-//!   nonce,
-//!   ephemeral_pub,  // per-session key
-//!   sig_gs,         // signed by long-term GS key
-//!   gs_pub          // long-term GS pub
-//!   }
+//! High-level trust flow:
+//!
+//! - A Game Server (GS) connects to VS over QUIC.
+//! - GS sends a `JoinRequest` with:
+//!   - gs_id
+//!   - sw_hash (binary hash of GS build)
+//!   - t_unix_ms + nonce (anti-replay)
+//!   - ephemeral_pub (fresh per-session key)
+//!   - sig_gs (signature using GS's long-term key, binding all of the above)
+//!   - gs_pub (the GS long-term public key)
+//!
 //! - VS verifies:
 //!   - sig_gs using gs_pub
 //!   - timestamp freshness (anti-replay)
-//!   - sw_hash allowlist (placeholder for now)
-//! - VS mints a session_id and stores SessionState {
-//!   gs_ephemeral_pub,
-//!   last_counter,
-//!   last_seen_ms
-//!   }
-//! - VS replies JoinAccept { session_id, sig_vs, vs_pub } to bind that GS to a session.
+//!   - sw_hash allowlist (TODO, placeholder for now)
 //!
-//! Runtime
-//! - GS opens new bi-streams to send Heartbeat {
-//!   session_id,
-//!   gs_counter,
-////!   gs_time_ms,
-//!   receipt_tip,
-//!   sig_gs_ephemeral
-//!   }
-//!   every ~2s.
-//!   VS checks:
-//!   - sig_gs_ephemeral against that session's gs_ephemeral_pub
-//!   - monotonic counter
-//!   - liveness; kill if stalled.
+//! - If accepted, VS mints a new session_id and stores session runtime state:
+//!   - the GS's per-session ephemeral_pub (used to verify heartbeats)
+//!   - last_counter and last_seen_ms for liveness
 //!
-//! - VS opens new bi-streams to send PlayTicket {
-//!   session_id,
-//!   client_binding,
-//!   counter,
-//!   not_before_ms,
-//!   not_after_ms,
-//!   prev_ticket_hash,
-//!   sig_vs
-//!   }
-//!   every ~2s.
-//!   Client will use these to prove “this GS is currently blessed by VS.”
+//! - VS replies with `JoinAccept { session_id, sig_vs, vs_pub }` so the GS
+//!   learns it is talking to the real VS and knows which session_id it owns.
+//!
+//! Runtime after join:
+//!
+//! - VS periodically sends `PlayTicket` to the GS (on fresh bi-streams).
+//!   These tickets are signed by VS and contain:
+//!   - session_id
+//!   - client_binding (who this ticket is for; future anti-alt)
+//!   - counter (monotonic)
+//!   - not_before_ms / not_after_ms (freshness window)
+//!   - prev_ticket_hash (hash chain)
+//!
+//!   The GS forwards the latest PlayTicket to clients. Clients refuse to send
+//!   gameplay input if that ticket expires. This is how VS can revoke a GS
+//!   quickly by just stopping tickets.
+//!
+//! - GS periodically opens a new bi-stream back to VS and sends either:
+//!   - `Heartbeat { session_id, gs_counter, gs_time_ms, receipt_tip, sig_gs }`
+//!     proving liveness. VS checks monotonic counter and verifies sig_gs
+//!     against the per-session ephemeral_pub.
+//!   - `TranscriptDigest { session_id, gs_counter, receipt_tip }`
+//!     summarizing GS's rolling transcript hash of accepted client inputs.
+//!     VS answers with `ProtectedReceipt { ..., sig_vs }`, which is a VS-
+//!     signed acknowledgement. Later, VS will refuse to sign if the GS is
+//!     cheating.
+//!
+//! - Watchdog: if heartbeats stall or counters stop increasing, VS closes the
+//!   QUIC connection and the session is considered dead.
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use common::{
     crypto::{heartbeat_sign_bytes, join_request_sign_bytes, now_ms, sha256, sign, verify},
     framing::{recv_msg, send_msg},
-    proto::{Heartbeat, JoinAccept, JoinRequest, PlayTicket, Sig},
+    proto::{
+        Heartbeat, JoinAccept, JoinRequest, PlayTicket, ProtectedReceipt, Sig, TranscriptDigest,
+    },
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use quinn::{Endpoint, ServerConfig};
@@ -68,11 +72,11 @@ use std::{
 };
 use tokio::time::sleep;
 
-/// Max allowed join timestamp skew (anti-replay)
-const JOIN_MAX_SKEW_MS: u64 = 10_000; // dev ~10s
+/// Max allowed join timestamp skew (anti-replay in JoinRequest)
+const JOIN_MAX_SKEW_MS: u64 = 10_000; // ~10s dev window
 
 /// How long we'll tolerate no valid heartbeat before killing session
-const HEARTBEAT_TIMEOUT_MS: u64 = 5_000; // dev ~5s
+const HEARTBEAT_TIMEOUT_MS: u64 = 5_000; // ~5s dev window
 
 #[derive(Parser, Debug)]
 struct Opts {
@@ -81,8 +85,8 @@ struct Opts {
     #[arg(long, default_value = "127.0.0.1:4444")]
     bind: String,
 
-    /// VS signing keypair (ed25519) used to sign JoinAccept.sig_vs
-    /// and PlayTicket.sig_vs
+    /// VS signing keypair (ed25519) used to sign JoinAccept.sig_vs,
+    /// PlayTicket.sig_vs, and ProtectedReceipt.sig_vs
     #[arg(long, default_value = "keys/vs_ed25519.pk8")]
     vs_sk: String,
     #[arg(long, default_value = "keys/vs_ed25519.pub")]
@@ -120,7 +124,9 @@ async fn main() -> Result<()> {
 
 /// Handle one GS QUIC connection end-to-end:
 /// - authenticate + admit GS
-/// - spawn heartbeat validator, ticket sender, watchdog
+/// - spawn ticket sender loop
+/// - spawn stream loop (heartbeats + transcript digests)
+/// - spawn watchdog for liveness timeout
 async fn handle_connection(connecting: quinn::Connecting, vs_sk: Arc<SigningKey>) -> Result<()> {
     // === handshake ===
     let conn = connecting.await.context("handshake accept")?;
@@ -133,6 +139,7 @@ async fn handle_connection(connecting: quinn::Connecting, vs_sk: Arc<SigningKey>
         .context("accept_bi for JoinRequest")?;
 
     let jr: JoinRequest = recv_msg(&mut vs_recv).await.context("recv JoinRequest")?;
+
     println!(
         "[VS] got JoinRequest from gs_id={} (ephemeral pub ..{}{})",
         jr.gs_id, jr.ephemeral_pub[0], jr.ephemeral_pub[1]
@@ -167,7 +174,7 @@ async fn handle_connection(connecting: quinn::Connecting, vs_sk: Arc<SigningKey>
     let mut session_id = [0u8; 16];
     OsRng.fill_bytes(&mut session_id);
 
-    // per-session runtime state we track for this conn
+    // Per-connection runtime state
     #[derive(Clone)]
     struct LocalState {
         ephemeral_pub: [u8; 32], // verify heartbeats against this
@@ -195,7 +202,7 @@ async fn handle_connection(connecting: quinn::Connecting, vs_sk: Arc<SigningKey>
 
     // === spawn runtime tasks ===
 
-    // ticket loop: VS → GS PlayTicket every ~2s
+    // (1) ticket sender loop: VS → GS PlayTicket every ~2s
     {
         let conn = conn.clone();
         let vs_sk = vs_sk.clone();
@@ -214,7 +221,7 @@ async fn handle_connection(connecting: quinn::Connecting, vs_sk: Arc<SigningKey>
 
                 // sign the ticket body with vs_sk
                 let body_tuple = (
-                    session_id, [0u8; 32], // client_binding placeholder
+                    session_id, [0u8; 32], // client_binding placeholder for now
                     counter, not_before, not_after, prev_hash,
                 );
                 let body_bytes = match bincode::serialize(&body_tuple) {
@@ -255,78 +262,124 @@ async fn handle_connection(connecting: quinn::Connecting, vs_sk: Arc<SigningKey>
         });
     }
 
-    // heartbeat validator: GS → VS liveness/sanity
+    // (2) stream loop: GS → VS Heartbeat / TranscriptDigest on fresh bi-streams
     {
         let conn = conn.clone();
         let state = state.clone();
         let session_id = session_id;
+        let vs_sk = vs_sk.clone();
         tokio::spawn(async move {
             loop {
-                // GS opens new bi-stream for each heartbeat
+                // GS opens new bi-stream for either Heartbeat or TranscriptDigest
                 let pair = conn.accept_bi().await;
-                let (send, mut recv) = match pair {
+                let (mut send, mut recv) = match pair {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("[VS] accept_bi heartbeat error: {e:?}");
+                        eprintln!("[VS] accept_bi stream error: {e:?}");
                         break;
                     }
                 };
-                drop(send);
 
-                let hb = match recv_msg::<Heartbeat>(&mut recv).await {
-                    Ok(hb) => hb,
-                    Err(e) => {
-                        eprintln!("[VS] bad Heartbeat decode: {e:?}");
+                // We read a tiny framing: 4-byte len LE, then that many bytes.
+                let mut len_bytes = [0u8; 4];
+                if recv.read_exact(&mut len_bytes).await.is_err() {
+                    eprintln!("[VS] stream read len failed");
+                    continue;
+                }
+                let len = u32::from_le_bytes(len_bytes) as usize;
+
+                let mut buf = vec![0u8; len];
+                if recv.read_exact(&mut buf).await.is_err() {
+                    eprintln!("[VS] stream read body failed");
+                    continue;
+                }
+
+                // Try TranscriptDigest first.
+                if let Ok(td) = bincode::deserialize::<TranscriptDigest>(&buf) {
+                    // Build ProtectedReceipt signed by VS.
+                    let pr_body =
+                        match bincode::serialize(&(td.session_id, td.gs_counter, td.receipt_tip)) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                eprintln!("[VS] ProtectedReceipt serialize body failed: {e:?}");
+                                continue;
+                            }
+                        };
+
+                    let sig_vs: Sig = sign(vs_sk.as_ref(), &pr_body);
+
+                    let pr = ProtectedReceipt {
+                        session_id: td.session_id,
+                        gs_counter: td.gs_counter,
+                        receipt_tip: td.receipt_tip,
+                        sig_vs,
+                    };
+
+                    if let Err(e) = send_msg(&mut send, &pr).await {
+                        eprintln!("[VS] send ProtectedReceipt failed: {e:?}");
+                    } else {
+                        println!(
+                            "[VS] ProtectedReceipt issued for ctr {} (session {}..)",
+                            td.gs_counter,
+                            hex::encode(&td.session_id[..4])
+                        );
+                    }
+
+                    continue;
+                }
+
+                // Otherwise, treat it as Heartbeat.
+                if let Ok(hb) = bincode::deserialize::<Heartbeat>(&buf) {
+                    // quick, lock and validate
+                    let mut st = state.lock().unwrap();
+
+                    // 1. session must match
+                    if hb.session_id != session_id {
+                        eprintln!("[VS] heartbeat session mismatch");
                         continue;
                     }
-                };
 
-                // quick, lock and validate
-                let mut st = state.lock().unwrap();
-
-                // 1. session must match
-                if hb.session_id != session_id {
-                    eprintln!("[VS] heartbeat session mismatch");
-                    continue;
-                }
-
-                // 2. counter monotonic
-                if hb.gs_counter <= st.last_counter {
-                    eprintln!(
-                        "[VS] heartbeat non-monotonic (got {}, last {})",
-                        hb.gs_counter, st.last_counter
-                    );
-                    continue;
-                }
-
-                // 3. verify sig_gs using the ephemeral per-session pubkey
-                let eph_vk = match VerifyingKey::from_bytes(&st.ephemeral_pub) {
-                    Ok(vk) => vk,
-                    Err(e) => {
-                        eprintln!("[VS] stored ephemeral_pub invalid: {e:?}");
-                        break;
+                    // 2. counter monotonic
+                    if hb.gs_counter <= st.last_counter {
+                        eprintln!(
+                            "[VS] heartbeat non-monotonic (got {}, last {})",
+                            hb.gs_counter, st.last_counter
+                        );
+                        continue;
                     }
-                };
 
-                let hb_bytes = heartbeat_sign_bytes(
-                    &hb.session_id,
-                    hb.gs_counter,
-                    hb.gs_time_ms,
-                    &hb.receipt_tip,
-                );
-                if !verify(&eph_vk, &hb_bytes, &hb.sig_gs) {
-                    eprintln!("[VS] heartbeat sig BAD");
+                    // 3. verify sig_gs using the ephemeral per-session pubkey
+                    let eph_vk = match VerifyingKey::from_bytes(&st.ephemeral_pub) {
+                        Ok(vk) => vk,
+                        Err(e) => {
+                            eprintln!("[VS] stored ephemeral_pub invalid: {e:?}");
+                            break;
+                        }
+                    };
+
+                    let hb_bytes = heartbeat_sign_bytes(
+                        &hb.session_id,
+                        hb.gs_counter,
+                        hb.gs_time_ms,
+                        &hb.receipt_tip,
+                    );
+                    if !verify(&eph_vk, &hb_bytes, &hb.sig_gs) {
+                        eprintln!("[VS] heartbeat sig BAD");
+                        continue;
+                    }
+
+                    // passed all checks → record liveness
+                    st.last_counter = hb.gs_counter;
+                    st.last_seen_ms = now_ms();
                     continue;
                 }
 
-                // passed all checks → record liveness
-                st.last_counter = hb.gs_counter;
-                st.last_seen_ms = now_ms();
+                eprintln!("[VS] unknown message on bi-stream");
             }
         });
     }
 
-    // watchdog: kill session if heartbeats stop
+    // (3) watchdog: kill session if heartbeats stop
     {
         let conn = conn.clone();
         let state = state.clone();

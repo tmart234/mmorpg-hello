@@ -33,7 +33,8 @@ use common::{
     proto::{ClientCmd, ClientInput, ServerHello},
     tcp_framing::{tcp_recv_msg, tcp_send_msg},
 };
-use ed25519_dalek::{Signature, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use rand::rngs::OsRng;
 use std::time::Duration;
 use tokio::{net::TcpStream, time::sleep};
 
@@ -65,6 +66,16 @@ async fn main() -> Result<()> {
     let sh: ServerHello = tcp_recv_msg(&mut sock).await.context("recv ServerHello")?;
     let ticket = sh.ticket.clone();
 
+    // Generate an ephemeral client keypair for THIS run/session.
+    // In future this might be an account key instead of ephemeral.
+    let client_sk = SigningKey::generate(&mut OsRng);
+    let client_pub = client_sk.verifying_key().to_bytes();
+
+    // Enforce that the ticket is actually meant for us, if bound.
+    if ticket.client_binding != [0u8; 32] && ticket.client_binding != client_pub {
+        bail!("ticket client_binding mismatch: this ticket isn't for our client_pub");
+    }
+
     // Sanity: ticket.session_id should match the session_id GS claims to be under.
     if ticket.session_id != sh.session_id {
         bail!("ServerHello session mismatch between GS and ticket");
@@ -72,7 +83,7 @@ async fn main() -> Result<()> {
 
     // 3. Verify VS signature on the ticket body.
     //
-    // VS signed this tuple EXACTLY (must match VS implementation):
+    // VS signed this tuple EXACTLY:
     // (session_id, client_binding, counter, not_before_ms, not_after_ms, prev_ticket_hash)
     //
     let body_tuple = (
@@ -113,9 +124,9 @@ async fn main() -> Result<()> {
     // While the ticket is fresh, keep sending ClientInput.
     // As soon as it goes stale → stop.
     //
-    // This models what the real game loop will do:
-    // - each frame / tick, we attach the latest VS-blessed ticket proof
-    // - if proof expires (VS revoked GS or liveness lost), we STOP SENDING INPUT.
+    // Each frame:
+    // - we sign a canonical tuple with our client key
+    // - the GS will recompute/verify that tuple
     //
     let mut next_nonce: u64 = 1;
 
@@ -134,24 +145,40 @@ async fn main() -> Result<()> {
             break;
         }
 
-        // Build ClientInput stapled with proof:
-        // - session_id: which GS session this input is for
-        // - ticket_counter / ticket_sig_vs: prove GS is still VS-blessed
-        // - client_nonce: strictly increasing per-client anti-replay
-        // - cmd: gameplay intent (move, fire, etc.)
-        //
+        // This is the command we're about to send this tick.
+        let this_cmd = ClientCmd::Move { dx: 1.0, dy: 0.0 };
+
+        // Canonical body that we (the client) sign.
+        // IMPORTANT: we pass a *slice* of sig_vs so bincode doesn't have to
+        // serialize a raw [u8;64] (Serde doesn't auto-derive >32 byte arrays).
+        let sign_body = (
+            sh.session_id,
+            ticket.counter,
+            &ticket.sig_vs[..],
+            next_nonce,
+            &this_cmd,
+        );
+        let sign_bytes = bincode::serialize(&sign_body)?;
+
+        // Sign with our ephemeral client_sk
+        let sig = client_sk.sign(&sign_bytes);
+
+        // Build ClientInput packet with proof stapled in
         let ci = ClientInput {
             session_id: sh.session_id,
             ticket_counter: ticket.counter,
-            ticket_sig_vs: ticket.sig_vs,
+            ticket_sig_vs: ticket.sig_vs, // [u8; 64]
             client_nonce: next_nonce,
-            cmd: ClientCmd::Move { dx: 1.0, dy: 0.0 },
+            cmd: this_cmd,
+
+            client_pub,
+            client_sig: sig.to_bytes(), // [u8; 64]
         };
 
+        // Send to GS
         tcp_send_msg(&mut sock, &ci)
             .await
             .context("send ClientInput")?;
-
         println!(
             "[CLIENT] sent input with nonce={}, ctr={}",
             next_nonce, ticket.counter
@@ -162,7 +189,7 @@ async fn main() -> Result<()> {
         // pretend this is our frame/tick cadence
         sleep(Duration::from_millis(200)).await;
 
-        // for smoke_test, we don't have to run forever.
+        // for smoke_test, bail after a handful of inputs
         if opts.smoke_test && next_nonce > 5 {
             break;
         }
