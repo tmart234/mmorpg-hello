@@ -1,7 +1,15 @@
 [package]
-name = "client-sim"
+name = "client-core"
 version = "0.1.0"
 edition.workspace = true
+
+[lib]
+name = "client_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "client-sim"
+path = "src/bin/client_sim.rs"
 
 [dependencies]
 anyhow         = { workspace = true }
