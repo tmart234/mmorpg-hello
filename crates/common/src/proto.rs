@@ -152,6 +152,7 @@ pub struct TicketUpdate {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ClientToGs {
     Input(ClientInput),
+    Bye,
 }
 
 /// Messages flowing GS -> Client over the local TCP link.

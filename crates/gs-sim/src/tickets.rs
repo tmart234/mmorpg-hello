@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use common::{
     crypto::{now_ms, sha256, verify},
     framing::recv_msg,
@@ -12,6 +12,45 @@ use tokio::{
 };
 
 use crate::state::Shared;
+
+/// Pure verifier for a PlayTicket against the last (counter, hash) and vs_pub.
+/// Returns the new hash to carry forward if OK.
+pub(crate) fn verify_and_hash_ticket(
+    prev_counter: u64,
+    prev_hash: [u8; 32],
+    pt: &PlayTicket,
+    vs_pub: &VerifyingKey,
+) -> Result<[u8; 32]> {
+    // 1) monotonic counter
+    if pt.counter != prev_counter + 1 {
+        bail!(
+            "ticket counter non-monotonic (got {}, expected {})",
+            pt.counter,
+            prev_counter + 1
+        );
+    }
+
+    // 2) hash chain continuity
+    if pt.prev_ticket_hash != prev_hash {
+        bail!("ticket prev_hash mismatch");
+    }
+
+    // 3) VS signature check over the canonical tuple
+    let body_tuple = (
+        pt.session_id,
+        pt.client_binding,
+        pt.counter,
+        pt.not_before_ms,
+        pt.not_after_ms,
+        pt.prev_ticket_hash,
+    );
+    let body_bytes = bincode::serialize(&body_tuple).context("ticket serialize")?;
+    if !verify(vs_pub, &body_bytes, &pt.sig_vs) {
+        bail!("ticket sig_vs BAD");
+    }
+
+    Ok(sha256(&body_bytes))
+}
 
 /// VS → GS ticket stream, plus revocation watchdog.
 ///
@@ -34,13 +73,9 @@ pub async fn ticket_listener(
         let shared_for_watchdog = shared.clone();
         let revoke_tx = revoke_tx.clone();
         tokio::spawn(async move {
-            // how long we're allowed to go without a new ticket
             const LIVENESS_BUDGET_MS: u64 = 2_500;
-
             loop {
                 sleep(Duration::from_millis(250)).await;
-
-                // check liveness without holding mutex across await
                 let (should_revoke, idle_ms) = {
                     let guard = shared_for_watchdog.lock().unwrap();
                     let last = guard.last_ticket_ms;
@@ -49,7 +84,6 @@ pub async fn ticket_listener(
                     let dead = last != 0 && idle > LIVENESS_BUDGET_MS;
                     (dead || guard.revoked, idle)
                 };
-
                 if should_revoke {
                     let mut guard = shared_for_watchdog.lock().unwrap();
                     if !guard.revoked {
@@ -66,7 +100,6 @@ pub async fn ticket_listener(
     }
 
     loop {
-        // VS opens a bi-stream and sends us exactly one PlayTicket.
         let pair = conn.accept_bi().await;
         let (_send, mut recv) = match pair {
             Ok(p) => p,
@@ -84,51 +117,28 @@ pub async fn ticket_listener(
             }
         };
 
-        // 1) monotonic counter
-        if pt.counter != last_counter + 1 {
-            eprintln!(
-                "[GS] ticket counter non-monotonic (got {}, expected {})",
-                pt.counter,
-                last_counter + 1
-            );
-            break;
+        // Verify the incoming ticket against our last (counter, hash)
+        match verify_and_hash_ticket(last_counter, last_hash, &pt, &vs_pub) {
+            Ok(new_hash) => {
+                // publish freshest ticket into shared + watchers
+                let now = now_ms();
+                {
+                    let mut guard = shared.lock().unwrap();
+                    guard.latest_ticket = Some(pt.clone());
+                    guard.last_ticket_ms = now;
+                    // once revoked=true we don't flip it back here
+                }
+                let _ = ticket_tx.send(Some(pt.clone()));
+                println!("[GS] ticket #{} (time_ok=true)", pt.counter);
+
+                last_counter = pt.counter;
+                last_hash = new_hash;
+            }
+            Err(e) => {
+                eprintln!("[GS] ticket verification failed: {e:?}");
+                break;
+            }
         }
-
-        // 2) hash chain continuity
-        if pt.prev_ticket_hash != last_hash {
-            eprintln!("[GS] ticket prev_hash mismatch");
-            break;
-        }
-
-        // 3) VS signature check over the canonical tuple
-        let body_tuple = (
-            pt.session_id,
-            pt.client_binding,
-            pt.counter,
-            pt.not_before_ms,
-            pt.not_after_ms,
-            pt.prev_ticket_hash,
-        );
-        let body_bytes = bincode::serialize(&body_tuple).context("ticket serialize")?;
-        if !verify(&vs_pub, &body_bytes, &pt.sig_vs) {
-            eprintln!("[GS] ticket sig_vs BAD");
-            break;
-        }
-
-        // publish freshest ticket into shared + watchers
-        let now = now_ms();
-        {
-            let mut guard = shared.lock().unwrap();
-            guard.latest_ticket = Some(pt.clone());
-            guard.last_ticket_ms = now;
-            // once revoked=true we don't flip it back here
-        }
-        let _ = ticket_tx.send(Some(pt.clone()));
-
-        println!("[GS] ticket #{} (time_ok=true)", pt.counter);
-
-        last_counter = pt.counter;
-        last_hash = sha256(&body_bytes);
     }
 
     Ok(())

@@ -1,6 +1,10 @@
 // crates/tools/src/smoke.rs
 //
 // CI-lite / `make ci` smoke test:
+
+// - REQ-VS-001/002 (tickets, receipts)
+// - REQ-GS-001/002/003/004 (verify ticket & sigs, client binding, movement, multi-client)
+// - REQ-CL-001/002 (pinning, persistent keys)
 //
 // 1. Ensure VS dev keys exist (keys/vs_ed25519.*). This matches what gs-sim
 //    and client-sim expect for VS signatures.

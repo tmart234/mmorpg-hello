@@ -1,7 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
 use client_core::*;
-use common::proto::ClientCmd;
+use common::proto::{ClientCmd, ClientToGs};
+use common::tcp_framing::tcp_send_msg;
 use tokio::time::{sleep, Duration};
 
 #[derive(Parser, Debug)]
@@ -36,5 +37,9 @@ async fn main() -> Result<()> {
             break;
         }
     }
+
+    // Graceful shutdown: tell GS we're done before closing the socket
+    let _ = tcp_send_msg(&mut sess.sock, &ClientToGs::Bye).await;
+
     Ok(())
 }

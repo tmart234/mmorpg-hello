@@ -13,3 +13,4 @@ serde = { workspace = true }
 tracing = { workspace = true }
 common = { path = "../common" }
 tokio = { workspace = true }
+bincode = { workspace = true }
