@@ -1,7 +1,7 @@
 // crates/tools/src/smoke.rs
 //
 // CI-lite / `make ci` smoke test:
-
+//
 // - REQ-VS-001/002 (tickets, receipts)
 // - REQ-GS-001/002/003/004 (verify ticket & sigs, client binding, movement, multi-client)
 // - REQ-CL-001/002 (pinning, persistent keys)
@@ -22,20 +22,20 @@
 //      - send nonce-monotonic ClientInput stapled to that ticket
 // 5. Wait for gs-sim to exit.
 // 6. Kill VS.
-// 7. Always exit 0 so local `make ci` doesn’t hard-fail your dev loop.
-//    (The logs are the real assertion.)
+// 7. By default exit 0 so local `make ci` doesn’t hard-fail your dev loop.
+//    Set STRICT_SMOKE=1 to make the harness return nonzero on failures.
 //
 // Differences from older version:
-//  - We now resolve explicit paths to ./target/debug/{vs,gs-sim,client-sim}
-//    so this works in GitHub Actions on Linux.
-//  - We now inherit stdout/stderr so CI prints *all* logs inline
-//    (VS logs, GS logs, CLIENT logs, heartbeat, etc).
+//  - Resolve explicit paths to ./target/debug/{vs,gs-sim,client-sim} for Linux CI.
+//  - Inherit stdout/stderr so CI prints all logs inline.
+//  - WAIT for the GS client TCP port before starting client-sim to avoid races.
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::{
     fs,
+    net::TcpStream,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -101,6 +101,18 @@ fn ensure_vs_keys() -> Result<()> {
     Ok(())
 }
 
+// Poll a TCP address until it accepts connections or we hit timeout_ms.
+fn wait_for_tcp(addr: &str, timeout_ms: u64) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    while std::time::Instant::now() < deadline {
+        if TcpStream::connect(addr).is_ok() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
 fn main() -> Result<()> {
     // 1. Make sure VS signing keys exist.
     ensure_vs_keys()?;
@@ -138,8 +150,10 @@ fn main() -> Result<()> {
         .spawn()
         .with_context(|| format!("spawn {:?}", gs_bin))?;
 
-    // Give gs-sim a moment to open its TCP port on 127.0.0.1:50000.
-    thread::sleep(Duration::from_millis(200));
+    // Wait for gs-sim to open its TCP port on 127.0.0.1:50000 (up to 5s).
+    if !wait_for_tcp("127.0.0.1:50000", 5000) {
+        eprintln!("[SMOKE] timeout waiting for gs-sim client port at 127.0.0.1:50000");
+    }
 
     // 4. Run client-sim in the foreground.
     //
@@ -184,7 +198,12 @@ fn main() -> Result<()> {
     let _ = vs_child.kill();
     let _ = vs_child.wait();
 
-    // 7. Always exit Ok. We log success/failure above.
+    // 7. Exit policy: default is success; STRICT_SMOKE=1 makes failures fatal.
+    let strict = std::env::var("STRICT_SMOKE").is_ok();
+    if strict && (!client_status.success() || !gs_status.success()) {
+        std::process::exit(1);
+    }
+
     println!("[SMOKE] done.");
     Ok(())
 }

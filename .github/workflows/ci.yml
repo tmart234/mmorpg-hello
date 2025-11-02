@@ -30,6 +30,8 @@ jobs:
 
       - name: Run CI-lite (fmt, clippy, build, test, smoke)
         run: make ci
+        env:
+          STRICT_SMOKE: "1"
 
       - name: Security audit
         run: |
