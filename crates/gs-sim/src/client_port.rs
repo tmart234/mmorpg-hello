@@ -129,10 +129,8 @@ pub async fn client_port_task(
 
                 // Receive exactly one client message.
                 let msg_res = recv_bin_tcp::<ClientToGs>(&mut socket).await;
-
-                // --- Handle both variants explicitly (fixes E0004) ---
                 let ci = match msg_res {
-                    Ok(ClientToGs::Input(ci)) => ci,
+                    Ok(ClientToGs::Input(ci)) => Some(ci),
                     Ok(ClientToGs::Bye) => {
                         println!("[GS] client {} said Bye; closing gracefully", peer_addr);
                         break;
@@ -141,6 +139,12 @@ pub async fn client_port_task(
                         eprintln!("[GS] recv ClientInput error from {peer_addr}: {e:?}");
                         break;
                     }
+                };
+
+                // If we didn’t get an Input (i.e., was Bye), end the loop.
+                let ci = match ci {
+                    Some(ci) => ci,
+                    None => break,
                 };
 
                 // Get freshest VS ticket (PlayTicket) to validate this input.

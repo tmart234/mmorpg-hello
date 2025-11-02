@@ -15,27 +15,23 @@ use crate::state::Shared;
 
 /// Pure verifier for a PlayTicket against the last (counter, hash) and vs_pub.
 /// Returns the new hash to carry forward if OK.
-pub(crate) fn verify_and_hash_ticket(
+pub fn verify_and_hash_ticket(
     prev_counter: u64,
     prev_hash: [u8; 32],
     pt: &PlayTicket,
-    vs_pub: &VerifyingKey,
+    vs_pk: &VerifyingKey,
 ) -> Result<[u8; 32]> {
-    // 1) monotonic counter
     if pt.counter != prev_counter + 1 {
         bail!(
-            "ticket counter non-monotonic (got {}, expected {})",
+            "counter mismatch: got {}, want {}",
             pt.counter,
             prev_counter + 1
         );
     }
-
-    // 2) hash chain continuity
     if pt.prev_ticket_hash != prev_hash {
-        bail!("ticket prev_hash mismatch");
+        bail!("prev_ticket_hash mismatch");
     }
 
-    // 3) VS signature check over the canonical tuple
     let body_tuple = (
         pt.session_id,
         pt.client_binding,
@@ -44,14 +40,14 @@ pub(crate) fn verify_and_hash_ticket(
         pt.not_after_ms,
         pt.prev_ticket_hash,
     );
-    let body_bytes = bincode::serialize(&body_tuple).context("ticket serialize")?;
-    if !verify(vs_pub, &body_bytes, &pt.sig_vs) {
-        bail!("ticket sig_vs BAD");
+    let body_bytes = bincode::serialize(&body_tuple).context("serialize ticket body")?;
+
+    if !verify(vs_pk, &body_bytes, &pt.sig_vs) {
+        bail!("VS signature invalid");
     }
 
     Ok(sha256(&body_bytes))
 }
-
 /// VS → GS ticket stream, plus revocation watchdog.
 ///
 /// - Listens for PlayTicket bi-streams from VS.

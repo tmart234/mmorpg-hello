@@ -3,6 +3,14 @@ name = "gs-sim"
 version = "0.1.0"
 edition.workspace = true
 
+[lib]
+name = "gs_sim"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gs-sim"
+path = "src/main.rs"
+
 [dependencies]
 anyhow        = { workspace = true }
 thiserror     = { workspace = true }
