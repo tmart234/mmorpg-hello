@@ -48,11 +48,12 @@ pub fn verify_and_hash_ticket(
 
     Ok(sha256(&body_bytes))
 }
+
 /// VS → GS ticket stream, plus revocation watchdog.
 ///
 /// - Listens for PlayTicket bi-streams from VS.
 /// - Verifies counters, hash chain, VS signature.
-/// - Updates shared.latest_ticket and notifies listeners.
+/// - Updates shared.latest_ticket (and shared.prev_ticket) and notifies listeners.
 /// - Runs a watchdog: if no fresh ticket in ~2.5s, mark revoked and broadcast.
 pub async fn ticket_listener(
     conn: Connection,
@@ -120,6 +121,8 @@ pub async fn ticket_listener(
                 let now = now_ms();
                 {
                     let mut guard = shared.lock().unwrap();
+                    // move current to prev, then set latest
+                    guard.prev_ticket = guard.latest_ticket.take();
                     guard.latest_ticket = Some(pt.clone());
                     guard.last_ticket_ms = now;
                     // once revoked=true we don't flip it back here

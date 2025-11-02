@@ -23,7 +23,7 @@ mod tickets;
 
 use crate::client_port::client_port_task;
 use crate::heartbeat::heartbeat_loop;
-use crate::state::{GsSharedState, Shared};
+use crate::state::{GsShared, Shared};
 use crate::tickets::ticket_listener;
 
 #[derive(Parser, Debug)]
@@ -134,11 +134,7 @@ async fn main() -> Result<()> {
     //
     // 7. Shared GS state (session, sw_hash, latest ticket, receipt_tip, revoked flag...).
     //
-    let shared: Shared = Arc::new(Mutex::new(GsSharedState::new(
-        ja.session_id,
-        ja.vs_pub,
-        sw_hash,
-    )));
+    let shared: Shared = Arc::new(Mutex::new(GsShared::new(ja.session_id, vs_vk, sw_hash)));
 
     //
     // 8. Channels:

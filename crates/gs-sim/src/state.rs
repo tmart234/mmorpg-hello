@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use common::proto::PlayTicket;
+use ed25519_dalek::VerifyingKey;
 
 /// Per-player world state tracked by GS.
-#[derive(Debug, Clone)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct PlayerState {
     pub x: f32,
     pub y: f32,
@@ -13,56 +14,43 @@ pub struct PlayerState {
 
 /// Global mutable GS session state shared across tasks.
 ///
-/// Wrapped as `Shared = Arc<Mutex<GsSharedState>>`.
-pub struct GsSharedState {
-    /// Session ID assigned by VS in JoinAccept.
+/// Wrapped as `Shared = Arc<Mutex<GsShared>>`.
+#[derive(Debug)]
+pub struct GsShared {
+    // Session basics
     pub session_id: [u8; 16],
+    pub vs_pub: VerifyingKey,
+    pub sw_hash: [u8; 32], // included so heartbeat can attach it
 
-    /// VS long-term pubkey (as raw bytes). We forward this to clients so they
-    /// can verify PlayTicket signatures and pin VS identity.
-    pub vs_pub: [u8; 32],
+    // World state
+    pub players: HashMap<[u8; 32], PlayerState>,
 
-    /// sw_hash of the running GS binary for this session.
-    /// We assert this in JoinRequest AND in every Heartbeat to prevent
-    /// "start clean, then hotpatch cheats mid-session".
-    pub sw_hash: [u8; 32],
-
-    /// Latest VS-issued PlayTicket we've accepted.
-    /// ticket_listener() keeps this fresh.
-    pub latest_ticket: Option<PlayTicket>,
-
-    /// ms-since-epoch when we last got a fresh ticket from VS.
-    /// Used by the watchdog to detect VS silence and mark us revoked.
-    pub last_ticket_ms: u64,
-
-    /// Rolling hash of accepted inputs + authoritative GS outcomes ("transcript tip").
-    /// heartbeat_loop sends this to VS so VS can notarize what we claim happened.
+    // Rolling transcript tip advertised in heartbeats
     pub receipt_tip: [u8; 32],
 
-    /// Has VS effectively revoked us?
-    /// ticket_listener/watchdog flips this to true if tickets stop or VS says kill it.
-    pub revoked: bool,
+    // Tickets (supporting rollover grace)
+    pub latest_ticket: Option<PlayTicket>,
+    pub prev_ticket: Option<PlayTicket>,
+    pub last_ticket_ms: u64,
 
-    /// All active/known players in this shard keyed by their pubkey.
-    /// This lets multiple clients coexist and lets us do per-player
-    /// replay protection and position authority.
-    pub players: HashMap<[u8; 32], PlayerState>,
+    // Trust state
+    pub revoked: bool,
 }
 
-impl GsSharedState {
-    pub fn new(session_id: [u8; 16], vs_pub: [u8; 32], sw_hash: [u8; 32]) -> Self {
+impl GsShared {
+    pub fn new(session_id: [u8; 16], vs_pub: VerifyingKey, sw_hash: [u8; 32]) -> Self {
         Self {
             session_id,
             vs_pub,
             sw_hash,
-            latest_ticket: None,
-            last_ticket_ms: 0,
-            receipt_tip: [0u8; 32],
-            revoked: false,
             players: HashMap::new(),
+            receipt_tip: [0u8; 32],
+            latest_ticket: None,
+            prev_ticket: None,
+            last_ticket_ms: 0,
+            revoked: false,
         }
     }
 }
 
-/// Arc<Mutex<...>> alias that the rest of GS code passes around.
-pub type Shared = Arc<Mutex<GsSharedState>>;
+pub type Shared = Arc<Mutex<GsShared>>;

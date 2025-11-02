@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use common::{
-    crypto::{client_input_sign_bytes, now_ms, sha256},
+    crypto::{client_input_sign_bytes, now_ms, receipt_tip_update},
     proto::{AuthoritativeEvent, ClientCmd, ClientToGs, PlayTicket, ServerHello, WorldSnapshot},
 };
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -78,9 +78,9 @@ pub async fn client_port_task(
         }
 
         // Snapshot session_id and vs_pub exactly once for this client.
-        let (session_id, vs_pub) = {
+        let (session_id, vs_pub_bytes) = {
             let guard = shared.lock().unwrap();
-            (guard.session_id, guard.vs_pub)
+            (guard.session_id, guard.vs_pub.to_bytes())
         };
 
         // Clone a local watch receiver for tickets so this client follows updates.
@@ -101,7 +101,7 @@ pub async fn client_port_task(
         let hello = ServerHello {
             session_id,
             ticket: first_ticket.clone(),
-            vs_pub,
+            vs_pub: vs_pub_bytes,
         };
 
         if let Err(e) = send_bin_tcp(&mut socket, &hello).await {
@@ -112,7 +112,6 @@ pub async fn client_port_task(
         // Each client gets its own async task so we can go back to accept()
         let shared_cloned = shared.clone();
         let revoke_rx_client = revoke_rx.clone();
-        let client_ticket_rx = local_ticket_rx; // move into task
         let session_id_for_client = session_id;
 
         tokio::spawn(async move {
@@ -147,16 +146,6 @@ pub async fn client_port_task(
                     None => break,
                 };
 
-                // Get freshest VS ticket (PlayTicket) to validate this input.
-                let cur_ticket_opt = client_ticket_rx.borrow().clone();
-                let cur_ticket = match cur_ticket_opt {
-                    Some(t) => t,
-                    None => {
-                        eprintln!("[GS] lost VS ticket mid-session for {peer_addr}");
-                        break;
-                    }
-                };
-
                 let now_ms_val = now_ms();
 
                 // === Everything that touches shared state lives in this block ===
@@ -172,48 +161,55 @@ pub async fn client_port_task(
                     };
                     let prev_tip = guard.receipt_tip;
 
-                    // ---- 1) ticket validation ----
+                    // Grab current and previous tickets atomically.
+                    let cur_ticket_opt = guard.latest_ticket.clone();
+                    let prev_ticket_opt = guard.prev_ticket.clone();
 
-                    // ticket counter must match input's claimed counter
-                    if ci.ticket_counter != cur_ticket.counter {
-                        eprintln!(
-                            "[GS] bad ticket_counter from {peer_addr} (got {}, expected {})",
-                            ci.ticket_counter, cur_ticket.counter
-                        );
-                        return Err(());
-                    }
+                    // Helper to validate the stapled ticket against a candidate PlayTicket.
+                    let ticket_matches = |pt: &PlayTicket| -> bool {
+                        if now_ms_val < pt.not_before_ms || now_ms_val > pt.not_after_ms {
+                            return false;
+                        }
+                        if pt.session_id != session_id_for_client {
+                            return false;
+                        }
+                        if pt.client_binding != [0u8; 32] && pt.client_binding != ci.client_pub {
+                            return false;
+                        }
+                        if ci.ticket_counter != pt.counter {
+                            return false;
+                        }
+                        if ci.ticket_sig_vs != pt.sig_vs {
+                            return false;
+                        }
+                        true
+                    };
 
-                    // ticket_sig_vs from client must match the VS-signed ticket
-                    if ci.ticket_sig_vs != cur_ticket.sig_vs {
-                        eprintln!("[GS] ticket_sig_vs mismatch from {peer_addr}");
-                        return Err(());
-                    }
-
-                    // ticket must be fresh: within not_before_ms .. not_after_ms
-                    if now_ms_val < cur_ticket.not_before_ms || now_ms_val > cur_ticket.not_after_ms
-                    {
-                        eprintln!("[GS] stale/expired ticket from {peer_addr}");
-                        return Err(());
-                    }
-
-                    // session_id binding check
-                    if ci.session_id != session_id_for_client
-                        || cur_ticket.session_id != session_id_for_client
-                    {
-                        eprintln!("[GS] session_id mismatch from {peer_addr}");
-                        return Err(());
-                    }
-
-                    // enforce ticket.client_binding, if set
-                    if cur_ticket.client_binding != [0u8; 32]
-                        && cur_ticket.client_binding != ci.client_pub
-                    {
-                        eprintln!(
-                            "[GS] client_binding mismatch from {peer_addr} \
-                             (ticket was not issued for this client_pub)"
-                        );
-                        return Err(());
-                    }
+                    // ---- 1) ticket validation with rollover grace (current OR previous) ----
+                    let using_prev_ticket = match cur_ticket_opt {
+                        Some(ref cur) if ticket_matches(cur) => false,
+                        Some(_) => {
+                            if let Some(ref prev) = prev_ticket_opt {
+                                if ticket_matches(prev) {
+                                    true
+                                } else {
+                                    eprintln!(
+                                        "[GS] ticket mismatch from {peer_addr} (neither current nor previous valid)"
+                                    );
+                                    return Err(());
+                                }
+                            } else {
+                                eprintln!(
+                                    "[GS] ticket mismatch from {peer_addr} (no previous ticket to grace)"
+                                );
+                                return Err(());
+                            }
+                        }
+                        None => {
+                            eprintln!("[GS] no current VS ticket available");
+                            return Err(());
+                        }
+                    };
 
                     // ---- 2) anti-replay / ordering via monotonically increasing client_nonce ----
                     if ci.client_nonce <= prev_nonce {
@@ -278,8 +274,8 @@ pub async fn client_port_task(
 
                             println!(
                                 "[GS] accepted Move {{ dx: {:.3}, dy: {:.3} }} \
-                                 (nonce={}, ticket_ctr={}) from {peer_addr}",
-                                dx, dy, ci.client_nonce, ci.ticket_counter
+                                 (nonce={}, ticket_ctr={}, used_prev_ticket={}) from {peer_addr}",
+                                dx, dy, ci.client_nonce, ci.ticket_counter, using_prev_ticket
                             );
 
                             (nx, ny)
@@ -311,20 +307,11 @@ pub async fn client_port_task(
                     };
 
                     // ---- 5) update rolling transcript tip + save it in shared ----
-                    //
-                    // new_tip = sha256(prev_tip || bincode(ci) || bincode(ev))
-                    let mut ci_bytes =
-                        bincode::serialize(&ci).expect("serialize ClientInput in GS");
-                    let mut ev_bytes =
+                    let ci_bytes = bincode::serialize(&ci).expect("serialize ClientInput in GS");
+                    let ev_bytes =
                         bincode::serialize(&ev).expect("serialize AuthoritativeEvent in GS");
 
-                    let mut both =
-                        Vec::with_capacity(prev_tip.len() + ci_bytes.len() + ev_bytes.len());
-                    both.extend_from_slice(&prev_tip);
-                    both.append(&mut ci_bytes);
-                    both.append(&mut ev_bytes);
-
-                    let new_tip = sha256(&both);
+                    let new_tip = receipt_tip_update(&prev_tip, &ci_bytes, &ev_bytes);
                     guard.receipt_tip = new_tip;
 
                     // update local tick counter

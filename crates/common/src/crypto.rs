@@ -1,6 +1,8 @@
 use crate::proto::{ClientCmd, PlayTicket};
+use bincode::{DefaultOptions, Options};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
+use serde::Serialize;
 use sha2::{Digest, Sha256 as Sha2};
 
 pub fn now_ms() -> u64 {
@@ -193,4 +195,22 @@ pub fn verify_ticket_sig(vs_pub: &VerifyingKey, pt: &PlayTicket) -> bool {
         &pt.prev_ticket_hash,
     );
     verify(vs_pub, &body, &pt.sig_vs)
+}
+
+/// Canonical update for the rolling transcript receipt tip:
+/// new_tip = sha256(prev_tip || client_input_bytes || authoritative_event_bytes)
+pub fn receipt_tip_update(prev_tip: &[u8; 32], ci_bytes: &[u8], ev_bytes: &[u8]) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(prev_tip.len() + ci_bytes.len() + ev_bytes.len());
+    buf.extend_from_slice(prev_tip);
+    buf.extend_from_slice(ci_bytes);
+    buf.extend_from_slice(ev_bytes);
+    sha256(&buf)
+}
+
+pub fn canonical_serialize<T: Serialize>(t: &T) -> Vec<u8> {
+    DefaultOptions::new()
+        .with_fixint_encoding() // stable integer encoding
+        .reject_trailing_bytes() // disallow extras
+        .serialize(t)
+        .expect("canonical serialize")
 }
