@@ -8,12 +8,16 @@ Client <-> GS <-> VS
 - **Client** – Only talks to GS, but refuses to trust GS unless GS can prove VS is still blessing it.
 
 Flow:
-1. GS joins VS with a signed JoinRequest (binds GS identity + ephemeral session key + build sw_hash + freshness).
-2. VS accepts and starts issuing short-lived, hash-chained PlayTickets to GS.
-3. GS forwards the current PlayTicket to the client.
-4. Client attaches the proof (and its own signatures) to each input.
-5. GS rejects input if the proof isn’t current / signed / fresh.
-6. VS can revoke a GS at runtime; that revocation ripples to all players in ~seconds via ticket starvation + connection close.
+1. **JoinRequest**: GS → VS, signed by GS long-term key; binds:
+   - `gs_id`, ephemeral session public key, `sw_hash` (binary hash), time + nonce.
+2. **JoinAccept**: VS → GS, returns `session_id` and signs it (pinning VS identity).
+3. **PlayTickets**: VS → GS issues short-lived, hash-chained tickets `{counter, nb/na, prev_ticket_hash}`.
+4. **Client inputs**: Client → GS includes:
+   - current `PlayTicket` (VS sig), `client_nonce` (monotone), `client_sig` over canonical bytes.
+5. **GS verifies** ticket freshness & chain, client sig/nonce, clamps movement, updates world, and advances a rolling **receipt_tip**.
+6. **Heartbeats**: GS → VS with `{session_id, gs_counter, gs_time_ms, receipt_tip, sw_hash}` signed by GS *ephemeral* session key.
+7. **ProtectedReceipt**: VS returns a short signature over `{session_id, gs_counter, receipt_tip}` to notarize the transcript so far.
+8. **Revocation**: If VS stops blessing (stops tickets / rejects heartbeat) → clients are kicked via ticket starvation + revoke broadcast.
 
 Goal: anti-cheat + anti-rogue-host + audit trail, built into the protocol.
 
@@ -39,3 +43,10 @@ Ephemeral session keys:
 
 World/physics enforcement (on VS):
 - VS measures movement between notarized snapshots (time from heartbeat, positions from digest) and revokes on speed violations.
+
+
+### Quick Start
+
+```bash
+# run full CI-lite (fmt, clippy, tests, smoke)
+make ci

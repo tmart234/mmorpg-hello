@@ -1,55 +1,95 @@
 # Makefile at repo root
 
-# Detect Windows vs Unix-y environments for clean steps
+# -------- OS detection (for clean commands) --------
 ifeq ($(OS),Windows_NT)
-	CLEAN_CMD = cargo clean && cmd /C del /F /Q Cargo.lock 2>nul || true
+SHELL := cmd
+PATH_SEP := \\
+RM_LOCK := del /F /Q Cargo.lock 2>nul || exit /B 0
 else
-	CLEAN_CMD = cargo clean && rm -f Cargo.lock || true
+SHELL := /bin/sh
+PATH_SEP := /
+RM_LOCK := rm -f Cargo.lock
 endif
 
-.PHONY: clean-lock-build
-clean-lock-build:
-	@echo "Cleaning target/ and Cargo.lock (DEV-ONLY destructive clean)..."
-	$(CLEAN_CMD)
-	cargo fmt --all
-	cargo build --workspace --all-targets
+# -------- Headless package set (what CI builds/tests) --------
+# Keep GUI crates (e.g., client-bevy) out of CI to avoid winit display issues.
+HEADLESS_PKGS := common client-core gs-core gs-sim vs tools
+PKG_FLAGS := $(foreach p,$(HEADLESS_PKGS),-p $(p))
 
-.PHONY: clean-build
+# -------- Phonies --------
+.PHONY: help ci check build-headless test-headless test-stage \
+        sim-positive clean-build clean-lock-build \
+        check-all build-all test-all
+
+# -------- Help --------
+help:
+	@echo "Targets:"
+	@echo "  ci                 - fmt+clippy only for headless crates, build, test, smoke"
+	@echo "  check              - fmt+clippy (headless crates only)"
+	@echo "  build-headless     - build headless crates (-p $(HEADLESS_PKGS))"
+	@echo "  test-headless      - cargo test for headless crates"
+	@echo "  test-stage         - test headless crates + run smoke (VS <-> GS <-> client)"
+	@echo "  sim-positive       - just run the smoke harness (gen_keys + smoke)"
+	@echo "  clean-build        - cargo clean + fmt + build (workspace, all targets)"
+	@echo "  clean-lock-build   - destructive: clean + remove Cargo.lock + fmt + build (workspace)"
+	@echo "  check-all          - fmt+clippy for the whole workspace"
+	@echo "  build-all          - build the whole workspace (includes GUI crates)"
+	@echo "  test-all           - cargo test for the whole workspace"
+
+# -------- CI (headless only) --------
+ci:
+	@echo "Lint (fmt + clippy)..."
+	cargo fmt --all -- --check
+	cargo clippy --all-targets $(PKG_FLAGS) -- -D warnings
+	@echo "Build headless crates..."
+	cargo build --all-targets $(PKG_FLAGS)
+	@echo "Run tests + smoke..."
+	$(MAKE) test-stage
+	@echo "CI-lite completed ✅"
+
+# -------- Local convenience (headless) --------
+check:
+	cargo fmt --all -- --check
+	cargo clippy --all-targets $(PKG_FLAGS) -- -D warnings
+
+build-headless:
+	cargo build --all-targets $(PKG_FLAGS)
+
+test-headless:
+	cargo test --all-targets $(PKG_FLAGS)
+
+# Run tests AND the smoke test (VS <-> gs-sim <-> client-sim happy path)
+test-stage: test-headless
+	@echo "Running smoke test (\`vs\` + \`gs-sim --test-once\` + \`client-sim --smoke-test\`)..."
+	cargo run -p tools --bin gen_keys
+	cargo run -p tools --bin smoke
+
+# Quick local sanity: just the smoke harness
+sim-positive:
+	cargo run -p tools --bin gen_keys
+	cargo run -p tools --bin smoke
+
+# -------- Clean flows --------
 clean-build:
 	@echo "Cleaning target/ (non-destructive: keeps Cargo.lock)..."
 	cargo clean
 	cargo fmt --all
 	cargo build --workspace --all-targets
 
-.PHONY: check
-check:
-	cargo fmt --all -- --check
-	cargo clippy --workspace --all-targets -- -D warnings
-
-# Run tests AND the smoke test (VS <-> gs-sim <-> client-sim happy path)
-.PHONY: test-stage
-test-stage:
-	@echo "Running cargo test..."
-	cargo test --workspace --all-targets
-	@echo "Running smoke test (\`vs\` + \`gs-sim --test-once\` + \`client-sim --smoke-test\`)..."
-	cargo run -p tools --bin gen_keys
-	cargo run -p tools --bin smoke
-
-# Quick local sanity (gen keys + run smoke only)
-.PHONY: sim-positive
-sim-positive:
-	cargo run -p tools --bin gen_keys
-	cargo run -p tools --bin smoke
-
-# CI-lite: lint, build, test, smoke
-# This is what GitHub Actions should run.
-.PHONY: ci
-ci:
-	@echo "Lint (fmt + clippy)..."
-	cargo fmt --all -- --check
-	cargo clippy --workspace --all-targets -- -D warnings
-	@echo "Build all targets..."
+clean-lock-build:
+	@echo "Cleaning target/ and Cargo.lock (DEV-ONLY destructive clean)..."
+	cargo clean
+	$(RM_LOCK)
+	cargo fmt --all
 	cargo build --workspace --all-targets
-	@echo "Run tests + smoke..."
-	$(MAKE) test-stage
-	@echo "CI-lite completed ✅"
+
+# -------- Whole-workspace (includes GUI crates) --------
+check-all:
+	cargo fmt --all -- --check
+	cargo clippy --workspace --all-targets -- -D warnings
+
+build-all:
+	cargo build --workspace --all-targets
+
+test-all:
+	cargo test --workspace --all-targets
