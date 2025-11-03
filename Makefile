@@ -93,3 +93,20 @@ build-all:
 
 test-all:
 	cargo test --workspace --all-targets
+
+# -------- Bevy (GUI client) orchestration --------
+# Builds everything needed, then runs VS + GS + client-bevy via tools/bin/play
+play:
+	@echo "Building client-bevy sanity3d..."
+	cargo build -p client-bevy --bin sanity3d
+	@echo "Running sanity3d (3D render/input/PBR sanity)..."
+	cargo run -p client-bevy --bin sanity3d -- --sanity
+
+play-full:
+	@echo "Building headless crates..."
+	cargo build --all-targets $(PKG_FLAGS)
+	@echo "Building client-bevy..."
+	cargo build -p client-bevy
+	@echo "Ensuring VS keys + launching VS, GS, and Bevy client..."
+	cargo run -p tools --bin gen_keys
+	cargo run -p tools --bin play

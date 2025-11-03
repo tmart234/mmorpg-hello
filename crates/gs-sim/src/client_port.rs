@@ -1,10 +1,17 @@
-use anyhow::{Context, Result};
+// crates/gs-sim/src/client_port.rs
+use anyhow::anyhow;
+use anyhow::Context;
 use common::{
     crypto::{client_input_sign_bytes, now_ms, receipt_tip_update},
     proto::{AuthoritativeEvent, ClientCmd, ClientToGs, PlayTicket, ServerHello, WorldSnapshot},
 };
 use ed25519_dalek::{Signature, VerifyingKey};
-use std::{convert::TryFrom, net::SocketAddr};
+use std::{
+    collections::VecDeque,
+    convert::TryFrom,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -18,9 +25,10 @@ use std::io::ErrorKind;
 
 const MAX_CLIENT_MSG: usize = 1024; // small and safe; raise if needed
 const NONCE_WINDOW: u64 = 4; // allow nonce jumps up to +4
+const TICKET_RING_MAX: usize = 32;
 
 /// Send a length-prefixed bincode message over a TCP stream.
-async fn send_bin_tcp<T: serde::Serialize>(sock: &mut TcpStream, msg: &T) -> Result<()> {
+async fn send_bin_tcp<T: serde::Serialize>(sock: &mut TcpStream, msg: &T) -> anyhow::Result<()> {
     let bytes = bincode::serialize(msg).context("serialize send_bin_tcp")?;
     let len_le = (bytes.len() as u32).to_le_bytes();
 
@@ -31,7 +39,7 @@ async fn send_bin_tcp<T: serde::Serialize>(sock: &mut TcpStream, msg: &T) -> Res
 }
 
 /// Receive a length-prefixed bincode message from a TCP stream.
-async fn recv_bin_tcp<T: serde::de::DeserializeOwned>(sock: &mut TcpStream) -> Result<T> {
+async fn recv_bin_tcp<T: serde::de::DeserializeOwned>(sock: &mut TcpStream) -> anyhow::Result<T> {
     let mut len_buf = [0u8; 4];
     sock.read_exact(&mut len_buf).await.context("read len")?;
     let len = u32::from_le_bytes(len_buf) as usize;
@@ -39,7 +47,7 @@ async fn recv_bin_tcp<T: serde::de::DeserializeOwned>(sock: &mut TcpStream) -> R
     // Reject-before-parse: length sanity
     if len == 0 || len > MAX_CLIENT_MSG {
         // Act like a DDoS guard: drop without parsing
-        return Err(anyhow::anyhow!("frame too large or zero (len={})", len));
+        return Err(anyhow!("frame too large or zero (len={})", len));
     }
 
     let mut buf = vec![0u8; len];
@@ -49,7 +57,7 @@ async fn recv_bin_tcp<T: serde::de::DeserializeOwned>(sock: &mut TcpStream) -> R
     Ok(msg)
 }
 
-/// Local TCP listener that talks to a client instance (client-sim for now).
+/// Local TCP listener that talks to a client instance (client-sim / client-bevy).
 ///
 /// Security properties per client socket:
 ///  - client must staple a fresh VS-signed PlayTicket
@@ -67,8 +75,8 @@ pub async fn client_port_task(
     shared: Shared,
     revoke_rx: watch::Receiver<bool>,
     ticket_rx: watch::Receiver<Option<PlayTicket>>,
-) -> Result<()> {
-    // Bind a local port for clients to connect (client-sim, future real client).
+) -> anyhow::Result<()> {
+    // Bind a local port for clients to connect (client-sim / client-bevy).
     let listener = TcpListener::bind("127.0.0.1:50000")
         .await
         .context("bind 127.0.0.1:50000")?;
@@ -95,18 +103,42 @@ pub async fn client_port_task(
         };
 
         // Clone a local watch receiver for tickets so this client follows updates.
-        // We will *wait* until we have a Some(PlayTicket) before proceeding.
+        // Wait until we have the first ticket, then seed a background "ticket ring" updater.
         let mut local_ticket_rx = ticket_rx.clone();
         let first_ticket: PlayTicket = loop {
             if let Some(t) = local_ticket_rx.borrow().clone() {
                 break t;
             }
-            // wait for VS to send the first PlayTicket via ticket_listener()
             if local_ticket_rx.changed().await.is_err() {
                 eprintln!("[GS] ticket_rx closed; shutting client_port_task listener");
                 return Ok(());
             }
         };
+
+        // === Ticket ring so we accept recently rolled tickets even when client idles ===
+        let ring: Arc<Mutex<VecDeque<PlayTicket>>> = Arc::new(Mutex::new(VecDeque::new()));
+        {
+            let mut r = ring.lock().unwrap();
+            r.push_back(first_ticket.clone());
+        }
+        // Watcher that pushes every new ticket into the ring (cap = TICKET_RING_MAX)
+        {
+            let mut rx = local_ticket_rx.clone();
+            let ring_for_watcher = ring.clone();
+            tokio::spawn(async move {
+                while rx.changed().await.is_ok() {
+                    if let Some(t) = rx.borrow().clone() {
+                        let mut r = ring_for_watcher.lock().unwrap();
+                        if r.back().map(|p| p.counter) != Some(t.counter) {
+                            r.push_back(t);
+                            while r.len() > TICKET_RING_MAX {
+                                r.pop_front();
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         // Send initial ServerHello with the first ticket.
         let hello = ServerHello {
@@ -136,6 +168,7 @@ pub async fn client_port_task(
         let shared_cloned = shared.clone();
         let revoke_rx_client = revoke_rx.clone();
         let session_id_for_client = session_id;
+        let ring_for_client = ring.clone();
 
         tokio::spawn(async move {
             // per-connection tick counter for snapshots
@@ -184,11 +217,12 @@ pub async fn client_port_task(
                     };
                     let prev_tip = guard.receipt_tip;
 
-                    // Grab current and previous tickets atomically.
-                    let cur_ticket_opt = guard.latest_ticket.clone();
-                    let prev_ticket_opt = guard.prev_ticket.clone();
+                    // === Ticket-ring validation (newest → oldest) ===
+                    let ring_snapshot: Vec<PlayTicket> = {
+                        let r = ring_for_client.lock().unwrap();
+                        r.iter().cloned().collect()
+                    };
 
-                    // Helper to validate the stapled ticket against a candidate PlayTicket.
                     let ticket_matches = |pt: &PlayTicket| -> bool {
                         if now_ms_val < pt.not_before_ms || now_ms_val > pt.not_after_ms {
                             return false;
@@ -208,31 +242,20 @@ pub async fn client_port_task(
                         true
                     };
 
-                    // ---- 1) ticket validation with rollover grace (current OR previous) ----
-                    let using_prev_ticket = match cur_ticket_opt {
-                        Some(ref cur) if ticket_matches(cur) => false,
-                        Some(_) => {
-                            if let Some(ref prev) = prev_ticket_opt {
-                                if ticket_matches(prev) {
-                                    true
-                                } else {
-                                    eprintln!(
-                                        "[GS] ticket mismatch from {peer_addr} (neither current nor previous valid)"
-                                    );
-                                    return Err(());
-                                }
-                            } else {
-                                eprintln!(
-                                    "[GS] ticket mismatch from {peer_addr} (no previous ticket to grace)"
-                                );
-                                return Err(());
-                            }
+                    let mut used_recent = false;
+                    for pt in ring_snapshot.iter().rev() {
+                        if ticket_matches(pt) {
+                            used_recent = true;
+                            break;
                         }
-                        None => {
-                            eprintln!("[GS] no current VS ticket available");
-                            return Err(());
-                        }
-                    };
+                    }
+                    if !used_recent {
+                        eprintln!(
+                            "[GS] ticket mismatch from {peer_addr} (not in recent ring of {} tickets)",
+                            ring_snapshot.len()
+                        );
+                        return Err(());
+                    }
 
                     // ---- 2) anti-replay / ordering via monotonically increasing client_nonce ----
                     if ci.client_nonce <= prev_nonce {
@@ -249,20 +272,17 @@ pub async fn client_port_task(
                         );
                         return Err(());
                     }
-                    // ---- 2a) rate-limit per-cmd using TokenBucket (makes CmdKey/TokenBucket "used") ----
-                    // Initialize runtime buckets once
+
+                    // ---- 2a) rate-limit per-cmd using TokenBucket (runtime buckets) ----
                     let rt = guard
                         .runtime
                         .get_or_insert_with(|| crate::state::PlayerRuntime {
                             buckets: std::collections::HashMap::new(),
                         });
 
-                    // Key by (client_pub, CmdKey) so each player has their own bucket per command.
                     let key = (ci.client_pub, crate::state::CmdKey::Move);
-
                     match rt.buckets.entry(key) {
                         std::collections::hash_map::Entry::Occupied(mut o) => {
-                            // Cost 1 token per Move; reject if empty.
                             if !o.get_mut().take(1.0, now_ms_val) {
                                 eprintln!("[GS] rate limit: too many Move ops from {peer_addr}");
                                 return Err(());
@@ -276,7 +296,6 @@ pub async fn client_port_task(
                     }
 
                     // ---- 3) verify client's signature over canonical tuple ----
-                    //    sign_bytes = bincode( (session_id, ticket_counter, ticket_sig_vs, client_nonce, cmd) )
                     let sign_bytes = client_input_sign_bytes(
                         &ci.session_id,
                         ci.ticket_counter,
@@ -285,7 +304,6 @@ pub async fn client_port_task(
                         &ci.cmd,
                     );
 
-                    // Parse claimed client_pub
                     let client_vk = match VerifyingKey::from_bytes(&ci.client_pub) {
                         Ok(vk) => vk,
                         Err(e) => {
@@ -294,7 +312,6 @@ pub async fn client_port_task(
                         }
                     };
 
-                    // Convert raw [u8;64] sig bytes to dalek Signature
                     let sig = match Signature::try_from(&ci.client_sig[..]) {
                         Ok(s) => s,
                         Err(_) => {
@@ -328,14 +345,13 @@ pub async fn client_port_task(
 
                             println!(
                                 "[GS] accepted Move {{ dx: {:.3}, dy: {:.3} }} \
-                                 (nonce={}, ticket_ctr={}, used_prev_ticket={}) from {peer_addr}",
-                                dx, dy, ci.client_nonce, ci.ticket_counter, using_prev_ticket
+                                 (nonce={}, ticket_ctr={}, used_recent={}) from {peer_addr}",
+                                dx, dy, ci.client_nonce, ci.ticket_counter, used_recent
                             );
 
                             (nx, ny)
                         }
                         ClientCmd::SpendCoins(_) => {
-                            // Economy path not wired yet: reject the input (fail closed).
                             eprintln!(
                                 "[GS] SpendCoins not implemented; rejecting from {}",
                                 peer_addr
@@ -381,7 +397,6 @@ pub async fn client_port_task(
                     let receipt_tip_copy = new_tip; // use updated tip
 
                     // ---- 5b) ledger append (optional if ledger present) ----
-                    // Use a stable 16-byte op_id (first 16 bytes of the client's signature works for demo)
                     let mut op_id16 = [0u8; 16];
                     op_id16.copy_from_slice(&ci.client_sig[..16]);
 

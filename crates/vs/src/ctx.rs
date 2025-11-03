@@ -4,7 +4,7 @@ use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 
 pub const JOIN_MAX_SKEW_MS: u64 = 10_000; // ~10s in dev
-pub const HEARTBEAT_TIMEOUT_MS: u64 = 5_000; // ~5s in dev
+pub const HEARTBEAT_TIMEOUT_MS: u64 = 10_000; // ~10s in dev
 
 #[derive(Clone)]
 pub struct VsCtx {

@@ -6,7 +6,7 @@ use rand::{rngs::OsRng, RngCore};
 
 use crate::ctx::{Session, VsCtx, JOIN_MAX_SKEW_MS};
 use crate::enforcer::enforcer;
-use crate::streams::{spawn_bistream_dispatch, spawn_ticket_loop};
+use crate::streams::{spawn_bistream_dispatch, spawn_ticket_loop, spawn_uni_heartbeat_listener};
 use crate::watchdog::spawn_watchdog;
 
 use common::{
@@ -98,7 +98,7 @@ pub async fn admit_and_run(connecting: quinn::Incoming, ctx: VsCtx) -> Result<()
     // Spawn runtime loops for this connection/session.
     spawn_ticket_loop(&conn, ctx.clone(), session_id);
     spawn_bistream_dispatch(&conn, ctx.clone(), session_id);
+    spawn_uni_heartbeat_listener(&conn, ctx.clone(), session_id); // <-- add this
     spawn_watchdog(&conn, ctx, session_id);
-
     Ok(())
 }

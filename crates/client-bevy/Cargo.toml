@@ -3,17 +3,16 @@ name = "client-bevy"
 version = "0.1.0"
 edition = "2021"
 
-# Windows: NO dynamic_linking (avoids LNK1189)
-[target.'cfg(windows)'.dependencies]
-bevy = { version = "0.14", default-features = false, features = [
-  "bevy_render", "bevy_sprite", "bevy_winit"
-] }
-
-# Non-Windows: OK to use dynamic_linking for faster rebuilds
-[target.'cfg(not(windows))'.dependencies]
-bevy = { version = "0.14", default-features = false, features = [
-  "bevy_render", "bevy_sprite", "bevy_winit", "dynamic_linking"
-] }
+[[bin]]
+name = "sanity3d"
+path = "src/main.rs"
 
 [dependencies]
+bevy         = { version = "0.17.2", default-features = true }
 client-core = { path = "../client-core" }
+tokio       = { workspace = true }
+common      = { path = "../common" }
+
+# Add dynamic_linking only for non-Windows builds
+[target.'cfg(not(windows))'.dependencies]
+bevy = { workspace = true, features = ["dynamic_linking"] }

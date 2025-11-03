@@ -15,6 +15,7 @@ resolver = "2"
 edition = "2021"
 
 [workspace.dependencies]
+bevy = { version = "0.17.2", default-features = false }
 anyhow = "1.0"
 tokio = { version = "1.48", features = ["full"] }
 
@@ -22,7 +23,7 @@ quinn = { version = "0.11.9", features = ["runtime-tokio", "rustls-ring"] }
 
 # rustls, with "dangerous_configuration" so we can provide a custom cert verifier
 rustls = { version = "0.23.34", features = ["ring"] }
-
+ctrlc = "3.5"
 bincode = "1.3"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
 sha2 = "0.10"

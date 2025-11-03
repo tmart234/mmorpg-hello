@@ -1,7 +1,7 @@
 // crates/vs/src/streams.rs
 use common::{
     crypto::{heartbeat_sign_bytes, now_ms, sha256, sign, verify},
-    framing::send_msg,
+    framing::{recv_msg, send_msg},
     proto::{Heartbeat, PlayTicket, ProtectedReceipt, Sig, TranscriptDigest},
 };
 use ed25519_dalek::VerifyingKey;
@@ -166,7 +166,11 @@ pub fn spawn_bistream_dispatch(conn: &Connection, ctx: VsCtx, session_id: [u8; 1
                 };
 
                 if let Err(e) = send_msg(&mut send, &pr).await {
-                    eprintln!("[VS] send ProtectedReceipt failed: {e:?}");
+                    let msg = format!("{e:?}");
+                    // GS intentionally drops the send-half after best-effort; treat these as benign
+                    if !msg.contains("stopped by peer") && !msg.contains("ClosedStream") {
+                        eprintln!("[VS] send ProtectedReceipt failed: {e:?}");
+                    }
                 } else if !is_dup {
                     println!(
                         "[VS] ProtectedReceipt issued for ctr {} (session {}..)",
@@ -251,6 +255,100 @@ pub fn spawn_bistream_dispatch(conn: &Connection, ctx: VsCtx, session_id: [u8; 1
             }
 
             eprintln!("[VS] unknown message type on bi-stream");
+        }
+    });
+}
+
+/// Listen for Heartbeat messages on **uni** streams.
+/// Updates `last_seen_ms`, verifies sig, and informs the enforcer.
+pub fn spawn_uni_heartbeat_listener(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
+    let conn = conn.clone();
+    let ctx = ctx.clone();
+
+    tokio::spawn(async move {
+        loop {
+            // one uni-stream per heartbeat
+            let mut recv = match conn.accept_uni().await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[VS] accept_uni (heartbeat) failed: {e:?}");
+                    break; // connection likely closing; exit task
+                }
+            };
+
+            let hb: Heartbeat = match recv_msg(&mut recv).await {
+                Ok(hb) => hb,
+                Err(e) => {
+                    eprintln!("[VS] recv Heartbeat failed: {e:?}");
+                    continue;
+                }
+            };
+
+            // Lookup the session (ephemeral pubkey lives here)
+            let (ephemeral_pub, revoked) = match ctx.sessions.get(&session_id) {
+                Some(s) => (s.ephemeral_pub, s.revoked),
+                None => {
+                    eprintln!(
+                        "[VS] heartbeat for unknown session {}..",
+                        hex::encode(&session_id[..4])
+                    );
+                    continue;
+                }
+            };
+            if revoked {
+                eprintln!(
+                    "[VS] heartbeat ignored for revoked session {}..",
+                    hex::encode(&session_id[..4])
+                );
+                continue;
+            }
+
+            // Verify GS heartbeat signature (ed25519 over canonical bytes)
+            let sig_arr: [u8; 64] = match hb.sig_gs.clone().try_into() {
+                Ok(a) => a,
+                Err(_) => {
+                    eprintln!(
+                        "[VS] bad hb.sig_gs length for session {}..",
+                        hex::encode(&session_id[..4])
+                    );
+                    continue;
+                }
+            };
+            let vk = match VerifyingKey::from_bytes(&ephemeral_pub) {
+                Ok(vk) => vk,
+                Err(e) => {
+                    eprintln!(
+                        "[VS] bad ephemeral_pub in session {}..: {e:?}",
+                        hex::encode(&session_id[..4])
+                    );
+                    continue;
+                }
+            };
+
+            let bytes = heartbeat_sign_bytes(
+                &hb.session_id,
+                hb.gs_counter,
+                hb.gs_time_ms,
+                &hb.receipt_tip,
+                &hb.sw_hash,
+            );
+            if !verify(&vk, &bytes, &sig_arr) {
+                eprintln!(
+                    "[VS] heartbeat signature invalid (sid {}.., ctr {})",
+                    hex::encode(&session_id[..4]),
+                    hb.gs_counter
+                );
+                continue;
+            }
+
+            // Mark last-seen and let the enforcer pin time/hash
+            if let Some(mut sess) = ctx.sessions.get_mut(&session_id) {
+                sess.last_seen_ms = now_ms();
+            }
+            if let Err(e) = enforcer().lock().unwrap().on_heartbeat(session_id, &hb) {
+                eprintln!("[VS] enforcer.on_heartbeat failed: {e:#}");
+                // Let watchdog close it if enforcer revoked
+            }
         }
     });
 }

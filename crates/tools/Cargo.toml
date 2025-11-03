@@ -11,9 +11,13 @@ path = "src/gen_keys.rs"
 name = "smoke"
 path = "src/smoke.rs"
 
+[[bin]]
+name = "play"
+path = "src/play.rs"
+
 [dependencies]
 clap = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
-
+ctrlc = { workspace = true }
 anyhow = { workspace = true }
