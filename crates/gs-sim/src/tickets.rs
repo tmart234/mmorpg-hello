@@ -1,3 +1,4 @@
+use crate::state::Shared;
 use anyhow::{bail, Context, Result};
 use common::{
     crypto::{now_ms, sha256, verify},
@@ -10,8 +11,6 @@ use tokio::{
     sync::watch,
     time::{sleep, Duration},
 };
-
-use crate::state::Shared;
 
 /// Pure verifier for a PlayTicket against the last (counter, hash) and vs_pub.
 /// Returns the new hash to carry forward if OK.

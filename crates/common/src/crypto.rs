@@ -120,9 +120,15 @@ pub fn client_input_sign_bytes(
     // command tag + payload
     match cmd {
         ClientCmd::Move { dx, dy } => {
-            out.push(0u8); // variant tag for Move
+            out.push(0u8); // tag: Move
             out.extend_from_slice(&dx.to_le_bytes());
             out.extend_from_slice(&dy.to_le_bytes());
+        }
+        ClientCmd::SpendCoins(sc) => {
+            out.push(1u8); // tag: SpendCoins
+                           // op_id: [u8; 16], amount: u64
+            out.extend_from_slice(&sc.op_id);
+            out.extend_from_slice(&sc.amount.to_le_bytes());
         }
     }
 

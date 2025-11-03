@@ -18,7 +18,13 @@ struct Opts {
 #[tokio::main]
 async fn main() -> Result<()> {
     let opts = Opts::parse();
-    let mut sess = connect_and_handshake(&opts.gs_addr).await?;
+
+    // Be resilient if GS hasn’t opened its client port yet:
+    //  - up to 10 attempts
+    //  - start with 150ms backoff, exponential to ~2s cap
+    let mut sess =
+        connect_and_handshake_with_retry(&opts.gs_addr, 10, Duration::from_millis(150)).await?;
+
     let mut nonce = 1_u64;
 
     loop {

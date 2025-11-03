@@ -33,6 +33,7 @@
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use std::time::SystemTime;
 use std::{
     fs,
     net::TcpStream,
@@ -111,6 +112,66 @@ fn wait_for_tcp(addr: &str, timeout_ms: u64) -> bool {
         thread::sleep(Duration::from_millis(50));
     }
     false
+}
+
+// ---------- Ledger E2E sanity checks (post-run) ----------
+
+fn newest_ledger_file(dir: &str) -> anyhow::Result<PathBuf> {
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for ent in fs::read_dir(dir).context("read ledger dir")? {
+        let ent = ent?;
+        let p = ent.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("log") {
+            continue;
+        }
+        let meta = ent.metadata().context("stat ledger entry")?;
+        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        if newest.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+            newest = Some((mtime, p));
+        }
+    }
+    newest
+        .map(|(_, p)| p)
+        .context("no ledger/*.log files found")
+}
+
+fn assert_recent_ledger_has_move() -> anyhow::Result<()> {
+    let path = newest_ledger_file("ledger")?;
+    let meta = fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+    anyhow::ensure!(meta.len() > 0, "ledger file is empty: {}", path.display());
+
+    // ensure it’s fresh (within the last 60s)
+    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let age = match SystemTime::now().duration_since(mtime) {
+        Ok(d) => d,
+        Err(_) => Duration::from_secs(0),
+    };
+    anyhow::ensure!(
+        age < Duration::from_secs(60),
+        "newest ledger is too old: {}",
+        path.display()
+    );
+
+    let body = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let last = body
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .context("ledger has no lines")?;
+    anyhow::ensure!(
+        last.starts_with('{') && last.ends_with('}'),
+        "last ledger line not JSON-ish"
+    );
+    anyhow::ensure!(
+        last.contains("\"op\":\"Move\""),
+        "last ledger line missing op=Move"
+    );
+
+    println!(
+        "[SMOKE] ledger OK: {} (last line has op=Move)",
+        path.display()
+    );
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -192,6 +253,18 @@ fn main() -> Result<()> {
             "[SMOKE] gs-sim exited nonzero (status={:?})",
             gs_status.code()
         );
+    }
+
+    // 5b. Sanity-check that a recent ledger file exists and its last line has op=Move.
+    match assert_recent_ledger_has_move() {
+        Ok(_) => {}
+        Err(e) => {
+            if std::env::var("STRICT_SMOKE").is_ok() {
+                anyhow::bail!("ledger check failed: {e:#}");
+            } else {
+                eprintln!("[SMOKE] ledger check warning: {e:#}");
+            }
+        }
     }
 
     // 6. Kill VS so it doesn't hang CI.

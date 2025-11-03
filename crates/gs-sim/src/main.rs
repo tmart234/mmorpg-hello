@@ -1,3 +1,4 @@
+// crates/gs-sim/src/main.rs
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use common::{
@@ -18,11 +19,13 @@ use tokio::{sync::watch, time::sleep};
 
 mod client_port;
 mod heartbeat;
+mod ledger;
 mod state;
 mod tickets;
 
 use crate::client_port::client_port_task;
 use crate::heartbeat::heartbeat_loop;
+use crate::ledger::Ledger;
 use crate::state::{GsShared, Shared};
 use crate::tickets::ticket_listener;
 
@@ -137,6 +140,15 @@ async fn main() -> Result<()> {
     let shared: Shared = Arc::new(Mutex::new(GsShared::new(ja.session_id, vs_vk, sw_hash)));
 
     //
+    // 7b. Open a session ledger (best-effort).
+    //
+    {
+        let mut guard = shared.lock().unwrap();
+        let hex4 = format!("{:02x}{:02x}", guard.session_id[0], guard.session_id[1]);
+        guard.ledger = Ledger::open_for_session(&hex4).ok();
+    }
+
+    //
     // 8. Channels:
     //    - revoke_tx / revoke_rx: broadcast "VS revoked this GS"
     //    - ticket_tx / ticket_rx: broadcast latest PlayTicket
@@ -145,7 +157,7 @@ async fn main() -> Result<()> {
     let (ticket_tx, ticket_rx) = watch::channel::<Option<PlayTicket>>(None);
 
     //
-    // 9. Spawn runtime tasks: heartbeat, ticket listener, client TCP port.
+    // 9. Spawn runtime tasks: heartbeat, ticket listener, (client port later).
     //
     // a) heartbeat_loop: GS → VS liveness + receipt_tip + sw_hash re-attestation
     let hb_counter = Arc::new(AtomicU64::new(0));
@@ -166,6 +178,17 @@ async fn main() -> Result<()> {
         revoke_tx.clone(),
         ticket_tx.clone(),
     ));
+
+    // === NEW: gate client port until we have the first ticket ===
+    {
+        let mut first_ticket_rx = ticket_tx.subscribe();
+        while first_ticket_rx.borrow().is_none() {
+            if first_ticket_rx.changed().await.is_err() {
+                bail!("ticket channel closed before first ticket");
+            }
+        }
+        println!("[GS] first PlayTicket received — opening client port");
+    }
 
     // c) client_port_task:
     //    TCP listener accepting local client-sim connections.
@@ -243,7 +266,6 @@ fn load_or_make_keys(sk_path: &str, pk_path: &str) -> Result<(SigningKey, Verify
 }
 
 /// Dev-only QUIC client config that skips cert verification.
-/// We do this because VS generates a fresh self-signed cert each run.
 fn make_client_cfg_insecure() -> Result<quinn::ClientConfig> {
     use rustls::{
         client::{
@@ -254,7 +276,6 @@ fn make_client_cfg_insecure() -> Result<quinn::ClientConfig> {
         DigitallySignedStruct, SignatureScheme,
     };
 
-    // Our "trust anything" verifier. ONLY for local dev.
     #[derive(Debug)]
     struct NoVerify;
 
@@ -297,14 +318,11 @@ fn make_client_cfg_insecure() -> Result<quinn::ClientConfig> {
         }
     }
 
-    // rustls 0.23 "dangerous" builder API: plug in our NoVerify.
     let tls_cfg = RustlsClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerify))
         .with_no_client_auth();
 
-    // Quinn 0.11 wants a quinn::crypto::ClientConfig (trait obj),
-    // not raw rustls::ClientConfig. We wrap it.
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls_cfg))
         .map_err(|e| anyhow!("QuicClientConfig::try_from: {e:?}"))?;
 

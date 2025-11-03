@@ -2073,6 +2073,7 @@ dependencies = [
  "rand 0.8.5",
  "rustls",
  "serde",
+ "serde_json",
  "sha2",
  "thiserror 2.0.17",
  "tokio",

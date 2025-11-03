@@ -9,7 +9,10 @@ use common::{
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use std::{fs, path::Path};
-use tokio::net::TcpStream;
+use tokio::{
+    net::TcpStream,
+    time::{sleep, timeout, Duration},
+};
 
 pub struct Session {
     pub sock: TcpStream,
@@ -89,7 +92,59 @@ pub fn load_or_create_client_keys() -> Result<(SigningKey, [u8; 32])> {
 
 // ---------- connect / handshake ----------
 
+/// One-shot connect + handshake. Kept for callers that don't want retry logic.
 pub async fn connect_and_handshake(gs_addr: &str) -> Result<Session> {
+    attempt_connect_and_handshake(gs_addr, Duration::from_secs(3)).await
+}
+
+/// Connect + handshake with retry/backoff. Retries only *transient* failures
+/// (connect errors, Hello timeout, EOF) — *not* trust or signature failures.
+pub async fn connect_and_handshake_with_retry(
+    gs_addr: &str,
+    max_attempts: usize,
+    initial_backoff: Duration,
+) -> Result<Session> {
+    let mut backoff = initial_backoff;
+    let mut attempt = 1usize;
+
+    loop {
+        match attempt_connect_and_handshake(gs_addr, Duration::from_secs(3)).await {
+            Ok(sess) => return Ok(sess),
+            Err(e) => {
+                // Fatal classes (do not retry): VS pinning mismatch or bad ticket signature/body.
+                let msg = format!("{e:#}");
+                let fatal = msg.contains("untrusted VS pubkey")
+                    || msg.contains("signature on PlayTicket did not verify")
+                    || msg.contains("ticket client_binding mismatch")
+                    || msg.contains("ServerHello session mismatch");
+
+                if fatal {
+                    return Err(e);
+                }
+
+                eprintln!(
+                    "[CLIENT] attempt {}/{} failed: {e}. Retrying in {} ms...",
+                    attempt,
+                    max_attempts,
+                    backoff.as_millis()
+                );
+
+                if attempt >= max_attempts {
+                    return Err(anyhow!("exhausted retries connecting to {}", gs_addr));
+                }
+
+                sleep(backoff).await;
+                // exponential backoff with cap ~2s
+                backoff = std::cmp::min(backoff * 2, Duration::from_millis(2000));
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// Internal: a single attempt to connect + receive `ServerHello` with a timeout.
+/// Uses a short deadline so the caller can decide on retry policy.
+async fn attempt_connect_and_handshake(gs_addr: &str, hello_timeout: Duration) -> Result<Session> {
     // 0) roots + identity
     let pinned_vs_pub = load_pinned_vs_pub()?;
     let (client_sk, client_pub) = load_or_create_client_keys()?;
@@ -99,8 +154,12 @@ pub async fn connect_and_handshake(gs_addr: &str) -> Result<Session> {
         .await
         .with_context(|| format!("connect to {}", gs_addr))?;
 
-    // 2) recv ServerHello { session_id, ticket, vs_pub }
-    let sh: ServerHello = tcp_recv_msg(&mut sock).await.context("recv ServerHello")?;
+    // 2) recv ServerHello { session_id, ticket, vs_pub } with timeout
+    let sh: ServerHello = timeout(hello_timeout, tcp_recv_msg(&mut sock))
+        .await
+        .map_err(|_| anyhow!("timeout waiting for ServerHello"))?
+        .context("recv ServerHello")?;
+
     let ticket: PlayTicket = sh.ticket.clone();
 
     // 3) enforce VS key pinning
@@ -172,16 +231,16 @@ pub async fn send_input(sess: &mut Session, nonce: u64, cmd: ClientCmd) -> Resul
     let sig = sess.client_sk.sign(&sign_bytes);
 
     let ci = ClientInput {
-        session_id: sess.session_id, // <-- [u8;16]
-        ticket_counter: sess.ticket.counter,
-        ticket_sig_vs: sess.ticket.sig_vs, // [u8;64]
+        session_id: sess.session_id,         // <-- [u8;16]
+        ticket_counter: sess.ticket.counter, // u32
+        ticket_sig_vs: sess.ticket.sig_vs,   // [u8;64]
         client_nonce: nonce,
         cmd,
         client_pub: sess.client_pub, // [u8;32]
         client_sig: sig.to_bytes(),  // [u8;64]
     };
 
-    let msg = ClientToGs::Input(ci);
+    let msg = ClientToGs::Input(Box::new(ci));
     tcp_send_msg(&mut sess.sock, &msg)
         .await
         .context("send ClientInput")

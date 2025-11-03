@@ -6,6 +6,8 @@ use serde_big_array::BigArray;
 /// become [u8;64] everywhere.
 pub type Sig = Vec<u8>;
 
+pub type OpId = [u8; 16];
+
 /// GS → VS during admission.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct JoinRequest {
@@ -79,12 +81,6 @@ pub struct ServerHello {
     pub vs_pub: [u8; 32],
 }
 
-/// Minimal set of player actions for now.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum ClientCmd {
-    Move { dx: f32, dy: f32 },
-}
-
 /// Client → GS input packet (one per "frame"/tick).
 /// The client staples a recent VS-signed PlayTicket and signs the whole thing.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -149,9 +145,9 @@ pub struct TicketUpdate {
 }
 
 /// Messages flowing Client -> GS over the local TCP link.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub enum ClientToGs {
-    Input(ClientInput),
+    Input(Box<ClientInput>),
     Bye,
 }
 
@@ -212,4 +208,17 @@ pub struct ProtectedReceipt {
 
     /// VS signature binding (session_id, gs_counter, receipt_tip).
     pub sig_vs: Sig,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SpendCoins {
+    pub op_id: OpId,
+    pub amount: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum ClientCmd {
+    Move { dx: f32, dy: f32 },
+    // Value-changing example (idempotent via op_id)
+    SpendCoins(SpendCoins),
 }

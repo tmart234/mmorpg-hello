@@ -12,7 +12,12 @@ use tokio::{
     time::{sleep, Duration},
 };
 
+use crate::ledger::LedgerEvent;
 use crate::state::{PlayerState, Shared};
+use std::io::ErrorKind;
+
+const MAX_CLIENT_MSG: usize = 1024; // small and safe; raise if needed
+const NONCE_WINDOW: u64 = 4; // allow nonce jumps up to +4
 
 /// Send a length-prefixed bincode message over a TCP stream.
 async fn send_bin_tcp<T: serde::Serialize>(sock: &mut TcpStream, msg: &T) -> Result<()> {
@@ -30,6 +35,12 @@ async fn recv_bin_tcp<T: serde::de::DeserializeOwned>(sock: &mut TcpStream) -> R
     let mut len_buf = [0u8; 4];
     sock.read_exact(&mut len_buf).await.context("read len")?;
     let len = u32::from_le_bytes(len_buf) as usize;
+
+    // Reject-before-parse: length sanity
+    if len == 0 || len > MAX_CLIENT_MSG {
+        // Act like a DDoS guard: drop without parsing
+        return Err(anyhow::anyhow!("frame too large or zero (len={})", len));
+    }
 
     let mut buf = vec![0u8; len];
     sock.read_exact(&mut buf).await.context("read body")?;
@@ -105,7 +116,19 @@ pub async fn client_port_task(
         };
 
         if let Err(e) = send_bin_tcp(&mut socket, &hello).await {
-            eprintln!("[GS] send ServerHello to {} failed: {e:?}", peer_addr);
+            // Early client drop during startup is normal with retrying clients.
+            if let Some(ioe) = e.downcast_ref::<std::io::Error>() {
+                match ioe.kind() {
+                    ErrorKind::ConnectionAborted
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::BrokenPipe => {
+                        eprintln!("[GS] client {peer_addr} dropped before Hello; will retry");
+                    }
+                    _ => eprintln!("[GS] send ServerHello to {peer_addr} failed: {e:?}"),
+                }
+            } else {
+                eprintln!("[GS] send ServerHello to {peer_addr} failed: {e:?}");
+            }
             continue 'accept_loop;
         }
 
@@ -129,7 +152,7 @@ pub async fn client_port_task(
                 // Receive exactly one client message.
                 let msg_res = recv_bin_tcp::<ClientToGs>(&mut socket).await;
                 let ci = match msg_res {
-                    Ok(ClientToGs::Input(ci)) => Some(ci),
+                    Ok(ClientToGs::Input(ci)) => Some(*ci), // enum carries Box<ClientInput>
                     Ok(ClientToGs::Bye) => {
                         println!("[GS] client {} said Bye; closing gracefully", peer_addr);
                         break;
@@ -219,6 +242,38 @@ pub async fn client_port_task(
                         );
                         return Err(());
                     }
+                    if ci.client_nonce > prev_nonce.saturating_add(NONCE_WINDOW) {
+                        eprintln!(
+                            "[GS] client_nonce jump too large from {peer_addr} (got {}, last {}, window {})",
+                            ci.client_nonce, prev_nonce, NONCE_WINDOW
+                        );
+                        return Err(());
+                    }
+                    // ---- 2a) rate-limit per-cmd using TokenBucket (makes CmdKey/TokenBucket "used") ----
+                    // Initialize runtime buckets once
+                    let rt = guard
+                        .runtime
+                        .get_or_insert_with(|| crate::state::PlayerRuntime {
+                            buckets: std::collections::HashMap::new(),
+                        });
+
+                    // Key by (client_pub, CmdKey) so each player has their own bucket per command.
+                    let key = (ci.client_pub, crate::state::CmdKey::Move);
+
+                    match rt.buckets.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(mut o) => {
+                            // Cost 1 token per Move; reject if empty.
+                            if !o.get_mut().take(1.0, now_ms_val) {
+                                eprintln!("[GS] rate limit: too many Move ops from {peer_addr}");
+                                return Err(());
+                            }
+                        }
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            let mut b = crate::state::TokenBucket::new(10.0, 10.0, now_ms_val); // cap=10, 10/sec
+                            let _ = b.take(1.0, now_ms_val); // spend the first token
+                            v.insert(b);
+                        }
+                    }
 
                     // ---- 3) verify client's signature over canonical tuple ----
                     //    sign_bytes = bincode( (session_id, ticket_counter, ticket_sig_vs, client_nonce, cmd) )
@@ -253,8 +308,7 @@ pub async fn client_port_task(
                         return Err(());
                     }
 
-                    // ---- 4) simulation step ----
-                    // clamp movement, apply to per-player world state
+                    // ---- 4) simulation / command handling ----
                     let (new_x, new_y) = match ci.cmd {
                         ClientCmd::Move { mut dx, mut dy } => {
                             // per-tick displacement cap (anti-speedhack / anti-teleport)
@@ -280,6 +334,14 @@ pub async fn client_port_task(
 
                             (nx, ny)
                         }
+                        ClientCmd::SpendCoins(_) => {
+                            // Economy path not wired yet: reject the input (fail closed).
+                            eprintln!(
+                                "[GS] SpendCoins not implemented; rejecting from {}",
+                                peer_addr
+                            );
+                            return Err(());
+                        }
                     };
 
                     // advance world tick
@@ -298,7 +360,6 @@ pub async fn client_port_task(
                     }
 
                     // Build an authoritative event for the transcript.
-                    // This is "what the GS actually says happened."
                     let ev = AuthoritativeEvent::MoveResolved {
                         who: ci.client_pub,
                         x: new_x,
@@ -313,6 +374,33 @@ pub async fn client_port_task(
 
                     let new_tip = receipt_tip_update(&prev_tip, &ci_bytes, &ev_bytes);
                     guard.receipt_tip = new_tip;
+
+                    // Prepare copies BEFORE borrowing ledger mutably (avoid mixed borrows).
+                    let session_id_copy = guard.session_id; // [u8; 16] Copy
+                    let client_pub_copy = ci.client_pub; // [u8; 32] Copy
+                    let receipt_tip_copy = new_tip; // use updated tip
+
+                    // ---- 5b) ledger append (optional if ledger present) ----
+                    // Use a stable 16-byte op_id (first 16 bytes of the client's signature works for demo)
+                    let mut op_id16 = [0u8; 16];
+                    op_id16.copy_from_slice(&ci.client_sig[..16]);
+
+                    if let Some(ledger) = guard.ledger.as_mut() {
+                        let log_ev = LedgerEvent {
+                            t_unix_ms: now_ms_val,
+                            session_id: &session_id_copy,
+                            client_pub: &client_pub_copy,
+                            op: "Move",
+                            op_id: &op_id16,
+                            delta: 0,
+                            balance_before: 0,
+                            balance_after: 0,
+                            receipt_tip: &receipt_tip_copy,
+                        };
+                        if let Err(e) = ledger.append(&log_ev) {
+                            eprintln!("[GS] ledger append failed: {e:?}");
+                        }
+                    }
 
                     // update local tick counter
                     tick = new_tick;

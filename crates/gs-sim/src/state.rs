@@ -4,6 +4,13 @@ use std::sync::{Arc, Mutex};
 use common::proto::PlayTicket;
 use ed25519_dalek::VerifyingKey;
 
+use crate::ledger::Ledger;
+
+#[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
+pub enum CmdKey {
+    Move, // future: Econ, Craft, etc.
+}
+
 /// Per-player world state tracked by GS.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PlayerState {
@@ -12,8 +19,14 @@ pub struct PlayerState {
     pub last_nonce: u64,
 }
 
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct PlayerRuntime {
+    pub buckets: HashMap<([u8; 32], CmdKey), TokenBucket>,
+    // future: recent_ops LRU for idempotency
+}
+
 /// Global mutable GS session state shared across tasks.
-///
 /// Wrapped as `Shared = Arc<Mutex<GsShared>>`.
 #[derive(Debug)]
 pub struct GsShared {
@@ -21,9 +34,6 @@ pub struct GsShared {
     pub session_id: [u8; 16],
     pub vs_pub: VerifyingKey,
     pub sw_hash: [u8; 32], // included so heartbeat can attach it
-
-    // World state
-    pub players: HashMap<[u8; 32], PlayerState>,
 
     // Rolling transcript tip advertised in heartbeats
     pub receipt_tip: [u8; 32],
@@ -33,8 +43,19 @@ pub struct GsShared {
     pub prev_ticket: Option<PlayTicket>,
     pub last_ticket_ms: u64,
 
+    // World state
+    pub players: HashMap<[u8; 32], PlayerState>,
+
     // Trust state
     pub revoked: bool,
+
+    // Economy/audit
+    #[allow(dead_code)]
+    pub ledger: Option<Ledger>,
+
+    // Runtime buckets / guards (optional until used everywhere)
+    #[allow(dead_code)]
+    pub runtime: Option<PlayerRuntime>,
 }
 
 impl GsShared {
@@ -43,12 +64,49 @@ impl GsShared {
             session_id,
             vs_pub,
             sw_hash,
-            players: HashMap::new(),
             receipt_tip: [0u8; 32],
+
             latest_ticket: None,
             prev_ticket: None,
             last_ticket_ms: 0,
+
+            players: HashMap::new(),
             revoked: false,
+
+            ledger: None,
+            runtime: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenBucket {
+    capacity: f32,
+    tokens: f32,
+    refill_per_ms: f32, // tokens per ms
+    last_ms: u64,
+}
+impl TokenBucket {
+    pub fn new(capacity: f32, refill_per_sec: f32, now_ms: u64) -> Self {
+        Self {
+            capacity,
+            tokens: capacity,
+            refill_per_ms: refill_per_sec / 1000.0,
+            last_ms: now_ms,
+        }
+    }
+    pub fn take(&mut self, cost: f32, now_ms: u64) -> bool {
+        // refill first
+        if now_ms > self.last_ms {
+            let dt = (now_ms - self.last_ms) as f32;
+            self.tokens = (self.tokens + dt * self.refill_per_ms).min(self.capacity);
+            self.last_ms = now_ms;
+        }
+        if self.tokens >= cost {
+            self.tokens -= cost;
+            true
+        } else {
+            false
         }
     }
 }

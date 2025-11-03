@@ -1,5 +1,6 @@
 pub mod client_port;
 pub mod heartbeat;
+pub mod ledger;
 pub mod state;
 pub mod tickets;
 
